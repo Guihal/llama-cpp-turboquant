@@ -24,6 +24,10 @@ class ZayaModel(TextModel):
         vocab_size = self.hparams["vocab_size"]
         self.gguf_writer.add_vocab_size(vocab_size)
 
+        # attention layer norm epsilon (RMS)
+        rms_eps = self.hparams.get("norm_epsilon", 1e-5)
+        self.gguf_writer.add_layer_norm_rms_eps(rms_eps)
+
         n_ff = self.hparams.get("ffn_hidden_size", 4096) // 2
         self.gguf_writer.add_feed_forward_length(n_ff)
 
@@ -177,7 +181,13 @@ class ZayaModel(TextModel):
             scores.append(score)
             toktypes.append(toktype)
 
-        assert len(tokens) == vocab.vocab_size
+        target_vocab_size = self.hparams["vocab_size"]
+        for i in range(len(tokens), target_vocab_size):
+            tokens.append(f"[PAD{i}]".encode("utf-8"))
+            scores.append(-1000.0)
+            toktypes.append(gguf.TokenType.UNUSED)
+
+        assert len(tokens) == target_vocab_size
 
         self.gguf_writer.add_tokenizer_model("gemma4")
         self.gguf_writer.add_token_list(tokens)
