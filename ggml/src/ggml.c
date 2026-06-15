@@ -2060,9 +2060,9 @@ struct ggml_tensor * ggml_dup_inplace(
 
 static struct ggml_tensor * ggml_add_impl(
         struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b,
-        bool                  inplace) {
+        struct ggml_tensor * a,
+        struct ggml_tensor * b,
+        bool inplace) {
     GGML_ASSERT(ggml_can_repeat(b, a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
@@ -4529,7 +4529,7 @@ struct ggml_tensor * ggml_conv_1d(
         int                   s0,
         int                   p0,
         int                   d0) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16); // [N, OL, IC * K]
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32); // [N, OL, IC * K]
 
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
@@ -4563,7 +4563,7 @@ struct ggml_tensor * ggml_conv_1d_dw(
         int                   d0) {
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
 
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16);
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
 
     struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a);
 
@@ -4581,6 +4581,63 @@ struct ggml_tensor * ggml_conv_1d_dw_ph(
         int                   s0,
         int                   d0) {
     return ggml_conv_1d_dw(ctx, a, b, s0, a->ne[0] / 2, d0);
+}
+
+// ggml_conv_1d_grouped
+
+struct ggml_tensor * ggml_conv_1d_grouped(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0,
+        int                   groups) {
+    GGML_ASSERT(groups > 0);
+
+    const int64_t OC   = a->ne[2];   // total output channels
+    const int64_t IC_G = a->ne[1];   // input channels per group (kernel dim)
+    const int64_t IC   = b->ne[1];   // total input channels
+
+    GGML_ASSERT(IC % groups == 0);
+    GGML_ASSERT(OC % groups == 0);
+    GGML_ASSERT(IC_G == IC / groups);
+
+    // degenerate cases: fall back to existing implementations
+    if (groups == 1) {
+        return ggml_conv_1d(ctx, a, b, s0, p0, d0);
+    }
+    if (groups == IC && groups == OC) {
+        return ggml_conv_1d_dw(ctx, a, b, s0, p0, d0);
+    }
+
+    const int64_t OC_G = OC / groups;
+
+    struct ggml_tensor * result = NULL;
+
+    for (int g = 0; g < groups; g++) {
+        // slice kernel for group g: [K, IC_G, OC_G]
+        struct ggml_tensor * a_g = ggml_view_3d(ctx, a,
+            a->ne[0], IC_G, OC_G,
+            a->nb[1], a->nb[2],
+            g * OC_G * a->nb[2]);
+
+        // slice input for group g: [L, IC_G, N]
+        struct ggml_tensor * b_g = ggml_view_3d(ctx, b,
+            b->ne[0], IC_G, b->ne[2],
+            b->nb[1], b->nb[2],
+            g * IC_G * b->nb[1]);
+
+        struct ggml_tensor * out_g = ggml_conv_1d(ctx, a_g, b_g, s0, p0, d0);
+
+        if (result == NULL) {
+            result = out_g;
+        } else {
+            result = ggml_concat(ctx, result, out_g, 1);
+        }
+    }
+
+    return result;
 }
 
 // ggml_conv_transpose_1d
@@ -4766,7 +4823,7 @@ struct ggml_tensor * ggml_conv_2d_dw(
     struct ggml_tensor * new_a = ggml_reshape_4d(ctx, a, a->ne[0], a->ne[1], 1, a->ne[2] * a->ne[3]);
     struct ggml_tensor * im2col = ggml_im2col(ctx, new_a,
                                         ggml_reshape_4d(ctx, b, b->ne[0], b->ne[1], 1, b->ne[2] * b->ne[3]),
-                                        s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F16); // [N * IC, OH, OW, KH * KW]
+                                        s0, s1, p0, p1, d0, d1, true, a->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32); // [N * IC, OH, OW, KH * KW]
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1], b->ne[2], b->ne[3]); // [N * IC, OH, OW, KH * KW] => [N, IC, OH * OW, KH * KW]
 
     new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OC，1, KH, KW] => [1, OC, 1, KH * KW]
