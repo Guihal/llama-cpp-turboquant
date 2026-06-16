@@ -7721,7 +7721,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S,
+    GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S, GGML_TYPE_TQ2_1S,
 };
 
 static const ggml_type base_types[] = {
@@ -8480,6 +8480,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // TQ2_1S / TQ3_1S: same fused-matvec kernel as TQ4_1S, same WHT, only the
+    // bit-unpack width differs. Test at production sizes to catch shared-memory
+    // or subgroup-reduction bugs that don't surface at M=16.
+    for (int k : { 1536, 2048, 2304, 3072, 4096 }) {
+        for (int m : { 256, 1152, 1536, 2048, 5120, 6144 }) {
+            for (int n : { 1, 2, 4, 8 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_1S, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // TQ4_1S: large-batch MUL_MAT exercises the dequant + f16 matmul path used
     // during prompt processing (n > mul_mat_vec_max_cols = 8 forces this path).
     // The fused mul_mat_vec kernel is NOT used for these cases; instead the weights
@@ -8665,6 +8679,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+
+    // TQ2_1S / TQ3_1S / TQ4_1S: MoE expert dispatch path. The mul_mat_vec_id
+    // shader is the same source as mul_mat_vec with MUL_MAT_ID define; this
+    // loop exercises the expert-indexed gather at production sizes.
+    for (int k : { 1536, 2048, 4096 }) {
+        for (int m : { 256, 2048 }) {
+            for (int n : { 1, 4, 16 }) {
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ2_1S, GGML_TYPE_F32, 16, 2, false, m, n, k));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 16, 2, false, m, n, k));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 16, 2, false, m, n, k));
+            }
+        }
+    }
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
