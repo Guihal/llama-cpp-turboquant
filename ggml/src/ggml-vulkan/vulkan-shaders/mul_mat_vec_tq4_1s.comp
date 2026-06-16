@@ -1,17 +1,21 @@
 #version 450
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
 #include "mul_mat_vec_base.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 // Lloyd-Max centroids for TQ4_1S (4-bit, 16 levels) — N(0, 1) optimal
-const float TQ4_CENTROIDS[16] = float[16](
-    -2.732590, -2.069017, -1.618046, -1.256231,
-    -0.942340, -0.656759, -0.388048, -0.128395,
-     0.128395,  0.388048,  0.656759,  0.942340,
-     1.256231,  1.618046,  2.069017,  2.732590
+// Pre-multiplied by TQ4_INV_SQRT32 to save 1 multiply per dequant.
+// ponytail: flat float[16] is better than vec4[4] pack — the 2-level index
+// (idx>>2, idx&3) increases VGPR pressure from 42 to 63.
+const float TQ4_CENTROIDS_SCALED[16] = float[16](
+    -0.48305823, -0.36575399, -0.28603282, -0.22207236,
+    -0.16658375, -0.11609969, -0.06859784, -0.02269724,
+     0.02269724,  0.06859784,  0.11609969,  0.16658375,
+     0.22207236,  0.28603282,  0.36575399,  0.48305823
 );
 
 // WHT sign pattern for 32-element blocks (shared by TQ3 and TQ4)
@@ -33,6 +37,10 @@ const float TQ4_INV_SQRT32 = 0.17677669529663688;
 
 shared float tq4_smem[8 * 32];
 
+// ponytail: for decode (NUM_COLS=1), use subgroupShuffleXor WHT — no shared
+// memory, no barriers. For NUM_COLS>1, fall back to shared-memory WHT.
+// This is the biggest single win for decode occupancy: removes 5 barriers
+// per block + 256 floats of shared memory.
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
 
@@ -51,55 +59,73 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint nibble_shift = (tid & 1u) * 4u;
     const float sign_tid    = TQ4_SIGNS[tid];
 
-    for (uint blk = 0; blk < num_blocks_per_row; blk++) {
-        // --- Stage 1: load activation, sign-flip, write to shared memory ---
-        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-            const uint b_base = c * p.batch_stride_b + b_offset + blk * 32u;
-            tq4_smem[c * 32u + tid] = float(data_b[b_base + tid]) * sign_tid;
-        }
-        barrier();
+    // ponytail: precompute weight base address outside loop — saves 1 mul + 1 add per block.
+    const uint w_base = a_offset + first_row * num_blocks_per_row;
 
-        // --- Stage 2: forward WHT butterfly in shared memory (5 stages) ---
-        [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
-            if ((tid & step) == 0u) {
-                const uint partner = tid + step;
-                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-                    const uint base = c * 32u;
-                    const float a = tq4_smem[base + tid];
-                    const float b = tq4_smem[base + partner];
-                    tq4_smem[base + tid]     = a + b;
-                    tq4_smem[base + partner] = a - b;
-                }
+    for (uint blk = 0; blk < num_blocks_per_row; blk++) {
+        // --- Load activation into register (shared across all columns) ---
+        const uint b_base = b_offset + blk * 32u;
+        float activation[NUM_COLS];
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            activation[c] = float(data_b[c * p.batch_stride_b + b_base + tid]) * sign_tid;
+        }
+
+        // --- WHT butterfly ---
+        // Decode (NUM_COLS=1): subgroupShuffleXor — 0 barriers, 0 shared memory.
+        // Prefill (NUM_COLS>1): shared memory — 1 barrier per stage.
+        if (NUM_COLS == 1u) {
+            // ponytail: subgroup WHT — each thread holds 1 element in a register.
+            // subgroupShuffleXor exchanges with the butterfly partner directly.
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                const float partner_val = subgroupShuffleXor(activation[0], step);
+                activation[0] = ((tid & step) == 0u)
+                    ? (activation[0] + partner_val)
+                    : (partner_val - activation[0]);
+            }
+        } else {
+            // Write to shared memory
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                tq4_smem[c * 32u + tid] = activation[c];
             }
             barrier();
+            // Butterfly in shared memory
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                if ((tid & step) == 0u) {
+                    const uint partner = tid + step;
+                    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                        const uint base = c * 32u;
+                        const float a = tq4_smem[base + tid];
+                        const float b = tq4_smem[base + partner];
+                        tq4_smem[base + tid]     = a + b;
+                        tq4_smem[base + partner] = a - b;
+                    }
+                }
+                barrier();
+            }
+            // Read back
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                activation[c] = tq4_smem[c * 32u + tid];
+            }
         }
 
-        // --- Stage 3: dequant all rows' weights for this block position ---
-        // Pre-computing the weight for every row before touching the column
-        // accumulator lets the compiler treat the smem read in stage 4 as
-        // loop-invariant across rows, which is the Vulkan analogue of the
-        // "hot loop load dedup" optimisation in the CUDA kernel (PR #57).
+        // --- Stage 3: dequant weights ---
         float w_vals[NUM_ROWS];
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            const uint ib  = (first_row + n) * num_blocks_per_row + blk;
-            const uint idx = (uint(data_a[a_offset + ib].qs[byte_idx]) >> nibble_shift) & 0xFu;
-            const float d  = (tid < 16u)
-                ? float(data_a[a_offset + ib].d0)
-                : float(data_a[a_offset + ib].d1);
-            w_vals[n] = TQ4_CENTROIDS[idx] * d * TQ4_INV_SQRT32;
+        for (uint n = 0; n < num_rows; ++n) {
+            const uint ib   = w_base + n * num_blocks_per_row + blk;
+            const float d0 = float(data_a[ib].d0);
+            const float d1 = float(data_a[ib].d1);
+            const float d  = (tid < 16u) ? d0 : d1;
+            const uint qbyte = uint(data_a[ib].qs[byte_idx]);
+            const uint idx   = (qbyte >> nibble_shift) & 0xFu;
+            w_vals[n] = TQ4_CENTROIDS_SCALED[idx] * d;
         }
 
         // --- Stage 4: accumulate dot products ---
-        // Read the rotated activation once per column; reuse across all rows.
         [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-            const float b_rotated = tq4_smem[c * 32u + tid];
-            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-                temp[c][n] += FLOAT_TYPE(w_vals[n] * b_rotated);
+            for (uint n = 0; n < num_rows; ++n) {
+                temp[c][n] += FLOAT_TYPE(w_vals[n] * activation[c]);
             }
         }
-
-        // Ensure every thread is done reading before the next block's store.
-        barrier();
     }
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
