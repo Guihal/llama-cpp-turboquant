@@ -7,38 +7,26 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-// Lloyd-Max centroids for TQ4_1S (4-bit, 16 levels) — N(0, 1) optimal
-// Pre-multiplied by 1/√32 to save 1 multiply per dequant.
-// ponytail: flat float[16] is better than vec4[4] pack — the 2-level index
-// (idx>>2, idx&3) increases VGPR pressure from 42 to 63.
-const float TQ4_CENTROIDS_SCALED[16] = float[16](
-    -0.48305823, -0.36575399, -0.28603282, -0.22207236,
-    -0.16658375, -0.11609969, -0.06859784, -0.02269724,
-     0.02269724,  0.06859784,  0.11609969,  0.16658375,
-     0.22207236,  0.28603282,  0.36575399,  0.48305823
+// Lloyd-Max centroids for TQ2_1S (2-bit, 4 levels) — N(0, 1) optimal
+// Pre-multiplied by TQ2_INV_SQRT32 to save 1 multiply per dequant.
+const float TQ2_CENTROIDS_SCALED[4] = float[4](
+    -0.26516506, -0.08838835,  0.08838835,  0.26516506
 );
 
-// WHT sign pattern for 32-element blocks (shared by TQ3 and TQ4)
-const float TQ4_SIGNS[32] = float[32](
+// WHT sign pattern for 32-element blocks (shared by TQ2, TQ3, TQ4)
+const float TQ2_SIGNS[32] = float[32](
     +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
     -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
     -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
     -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0
 );
 
-// See the commit message on a850ccc for the full derivation and portability
-// rationale.  Short version: pre-rotate the activation block via forward WHT
-// in shared memory, then dot-product against the raw centroid*scale weights.
-//
+const float TQ2_INV_SQRT32 = 0.17677669529663688;
+
 // Shared memory budget: NUM_COLS * 32 floats (max 1 KiB at NUM_COLS=8)
 // plus whatever tmpsh the reduction helper allocates.
+shared float tq2_smem[8 * 32];
 
-shared float tq4_smem[8 * 32];
-
-// ponytail: for decode (NUM_COLS=1), use subgroupShuffleXor WHT — no shared
-// memory, no barriers. For NUM_COLS>1, fall back to shared-memory WHT.
-// This is the biggest single win for decode occupancy: removes 5 barriers
-// per block + 256 floats of shared memory.
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
 
@@ -53,11 +41,11 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 
     const uint num_blocks_per_row = p.ncols / 32u;
-    const uint byte_idx     = tid / 2u;
-    const uint nibble_shift = (tid & 1u) * 4u;
-    const float sign_tid    = TQ4_SIGNS[tid];
+    // 2-bit unpack: 4 values per byte, nibble-style
+    const uint byte_idx     = tid / 4u;
+    const uint nibble_shift = (tid & 3u) * 2u;
+    const float sign_tid    = TQ2_SIGNS[tid];
 
-    // ponytail: precompute weight base address outside loop — saves 1 mul + 1 add per block.
     const uint w_base = a_offset + first_row * num_blocks_per_row;
 
     for (uint blk = 0; blk < num_blocks_per_row; blk++) {
@@ -69,11 +57,8 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
 
         // --- WHT butterfly ---
-        // Decode (NUM_COLS=1): subgroupShuffleXor — 0 barriers, 0 shared memory.
-        // Prefill (NUM_COLS>1): shared memory — 1 barrier per stage.
         if (NUM_COLS == 1u) {
-            // ponytail: subgroup WHT — each thread holds 1 element in a register.
-            // subgroupShuffleXor exchanges with the butterfly partner directly.
+            // subgroupShuffleXor WHT — 0 barriers, 0 shared memory (decode)
             [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
                 const float partner_val = subgroupShuffleXor(activation[0], step);
                 activation[0] = ((tid & step) == 0u)
@@ -81,32 +66,30 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
                     : (partner_val - activation[0]);
             }
         } else {
-            // Write to shared memory
+            // Shared memory WHT (prefill)
             [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-                tq4_smem[c * 32u + tid] = activation[c];
+                tq2_smem[c * 32u + tid] = activation[c];
             }
             barrier();
-            // Butterfly in shared memory
             [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
                 if ((tid & step) == 0u) {
                     const uint partner = tid + step;
                     [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
                         const uint base = c * 32u;
-                        const float a = tq4_smem[base + tid];
-                        const float b = tq4_smem[base + partner];
-                        tq4_smem[base + tid]     = a + b;
-                        tq4_smem[base + partner] = a - b;
+                        const float a = tq2_smem[base + tid];
+                        const float b = tq2_smem[base + partner];
+                        tq2_smem[base + tid]     = a + b;
+                        tq2_smem[base + partner] = a - b;
                     }
                 }
                 barrier();
             }
-            // Read back
             [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-                activation[c] = tq4_smem[c * 32u + tid];
+                activation[c] = tq2_smem[c * 32u + tid];
             }
         }
 
-        // --- Stage 3: dequant weights ---
+        // --- Stage 3: dequant weights (2-bit nibble unpack) ---
         float w_vals[NUM_ROWS];
         for (uint n = 0; n < num_rows; ++n) {
             const uint ib   = w_base + n * num_blocks_per_row + blk;
@@ -114,8 +97,8 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             const float d1 = float(data_a[ib].d1);
             const float d  = (tid < 16u) ? d0 : d1;
             const uint qbyte = uint(data_a[ib].qs[byte_idx]);
-            const uint idx   = (qbyte >> nibble_shift) & 0xFu;
-            w_vals[n] = TQ4_CENTROIDS_SCALED[idx] * d;
+            const uint idx   = (qbyte >> nibble_shift) & 0x3u;
+            w_vals[n] = TQ2_CENTROIDS_SCALED[idx] * d;
         }
 
         // --- Stage 4: accumulate dot products ---
@@ -125,8 +108,6 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             }
         }
     }
-
-
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }

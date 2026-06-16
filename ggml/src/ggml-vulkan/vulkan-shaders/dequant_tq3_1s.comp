@@ -1,0 +1,80 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+// 256 threads per workgroup, each thread fully dequants one TQ3_1S block
+// (32 elements, 16 bytes). Workgroups process 256 blocks = 8192 elements each
+// so the x dispatch stays under maxComputeWorkGroupCount[0] for large tensors.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_tq3_1s data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    // Lloyd-Max centroids for 3-bit normal quantization (8 levels)
+    // Copied verbatim from ggml-turbo-quant.c:668-670
+    const float centroids[8] = float[8](
+        -1.996684, -1.291398, -0.740341, -0.247508,
+         0.230106,  0.725222,  1.277503,  1.988943
+    );
+
+    // WHT sign pattern for inverse RHT normalization
+    const float signs[32] = float[32](
+        +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+        -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0
+    );
+
+    const float INV_SQRT32 = 0.17677669529663688;
+
+    const uint ib = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (ib >= p.nel / 32) return;
+
+    const float d0 = float(data_a[ib].d0);
+    const float d1 = float(data_a[ib].d1);
+
+    // Load centroid*scale into per-thread buffer
+    // 3-bit unpack: 4 groups of 8 indices, each packed in 3 bytes (24 bits)
+    // Cross-byte formula: ggml-turbo-quant.c:866-873
+    float buf[32];
+    for (int g = 0; g < 4; g++) {
+        const uint qp_base = uint(g) * 3u;
+        const uint q0 = uint(data_a[ib].qs[qp_base + 0u]);
+        const uint q1 = uint(data_a[ib].qs[qp_base + 1u]);
+        const uint q2 = uint(data_a[ib].qs[qp_base + 2u]);
+        const uint idx[8] = uint[8](
+            q0 & 7u,                              // idx[0]
+            (q0 >> 3) & 7u,                       // idx[1]
+            ((q0 >> 6) | (q1 << 2)) & 7u,         // idx[2] CROSS BYTE
+            (q1 >> 1) & 7u,                       // idx[3]
+            (q1 >> 4) & 7u,                       // idx[4]
+            ((q1 >> 7) | (q2 << 1)) & 7u,         // idx[5] CROSS BYTE
+            (q2 >> 2) & 7u,                       // idx[6]
+            (q2 >> 5) & 7u                        // idx[7]
+        );
+        for (int i = 0; i < 8; i++) {
+            const int j = g * 8 + i;
+            const float d = (j < 16) ? d0 : d1;
+            buf[j] = centroids[idx[i]] * d;
+        }
+    }
+
+    // Inverse WHT butterfly (5 stages for 32 elements) — matches CPU reference
+    for (uint step = 1u; step < 32u; step <<= 1u) {
+        for (uint i = 0u; i < 32u; i += step * 2u) {
+            for (uint j = i; j < i + step; j++) {
+                const float a = buf[j];
+                const float b = buf[j + step];
+                buf[j]        = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+
+    // Normalize and apply sign pattern
+    const uint out_base = ib * 32u;
+    for (int j = 0; j < 32; j++) {
+        data_b[out_base + uint(j)] = D_TYPE(buf[j] * INV_SQRT32 * signs[j]);
+    }
+}
