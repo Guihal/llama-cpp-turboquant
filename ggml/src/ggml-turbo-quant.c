@@ -767,14 +767,19 @@ static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s
         memcpy(buf, src_blk, TQ_BLOCK_SIZE * sizeof(float));
         tq3_0_rht_forward(buf);
 
-        /* Block-scalar imatrix weights (WHT mixes all 32 elems -> per-element I meaningless) */
+        /* Block-scalar imatrix weight: single mean over all 32 pre-RHT elements.
+         * The WHT butterfly mixes every input coordinate into every output
+         * coordinate, so there is no half-to-half correspondence between the
+         * unrotated imatrix indices and the rotated buf[] halves — a single
+         * scalar covering the full 32-element block is correct, not two
+         * separate halves. */
         float w0 = 1.0f, w1 = 1.0f;
         if (qw) {
-            float s0 = 0.0f, s1 = 0.0f;
-            for (int j = 0; j < 16; j++) s0 += qw[block*32 + j];
-            for (int j = 16; j < 32; j++) s1 += qw[block*32 + j];
-            w0 = s0 / 16.0f; if (w0 < 1e-6f) w0 = 1e-6f;
-            w1 = s1 / 16.0f; if (w1 < 1e-6f) w1 = 1e-6f;
+            float s = 0.0f;
+            for (int j = 0; j < TQ_BLOCK_SIZE; j++) s += qw[block*32 + j];
+            float w = s / (float)TQ_BLOCK_SIZE;
+            if (w < 1e-6f) w = 1e-6f;
+            w0 = w; w1 = w;
         }
 
         /* 2. Split into two halves, compute RMS per half */
@@ -932,14 +937,19 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
         memcpy(buf, src_blk, TQ_BLOCK_SIZE * sizeof(float));
         tq3_0_rht_forward(buf);
 
-        /* Block-scalar imatrix weights (WHT mixes all 32 elems -> per-element I meaningless) */
+        /* Block-scalar imatrix weight: single mean over all 32 pre-RHT elements.
+         * The WHT butterfly mixes every input coordinate into every output
+         * coordinate, so there is no half-to-half correspondence between the
+         * unrotated imatrix indices and the rotated buf[] halves — a single
+         * scalar covering the full 32-element block is correct, not two
+         * separate halves. */
         float w0 = 1.0f, w1 = 1.0f;
         if (qw) {
-            float s0 = 0.0f, s1 = 0.0f;
-            for (int j = 0; j < 16; j++) s0 += qw[block*32 + j];
-            for (int j = 16; j < 32; j++) s1 += qw[block*32 + j];
-            w0 = s0 / 16.0f; if (w0 < 1e-6f) w0 = 1e-6f;
-            w1 = s1 / 16.0f; if (w1 < 1e-6f) w1 = 1e-6f;
+            float s = 0.0f;
+            for (int j = 0; j < TQ_BLOCK_SIZE; j++) s += qw[block*32 + j];
+            float w = s / (float)TQ_BLOCK_SIZE;
+            if (w < 1e-6f) w = 1e-6f;
+            w0 = w; w1 = w;
         }
 
         /* 2. Split into two halves, compute RMS per half */
@@ -1075,14 +1085,16 @@ static void quantize_row_tq2_1s_impl(const float * GGML_RESTRICT x, block_tq2_1s
         float buf[32];
         memcpy(buf, x + b*32, 32*sizeof(float));
         tq3_0_rht_forward(buf);
-        // Block-scalar imatrix weights (WHT mixes all 32 elems -> per-element I meaningless)
+        // Block-scalar imatrix weight: single mean over all 32 pre-RHT elements
+        // (WHT mixes every input coord into every output coord, so there is
+        // no half-to-half correspondence — see TQ3_1S/TQ4_1S impl for full note)
         float w0 = 1.0f, w1 = 1.0f;
         if (qw) {
-            float s0 = 0.0f, s1 = 0.0f;
-            for (int j = 0; j < 16; j++) s0 += qw[b*32 + j];
-            for (int j = 16; j < 32; j++) s1 += qw[b*32 + j];
-            w0 = s0 / 16.0f; if (w0 < 1e-6f) w0 = 1e-6f;
-            w1 = s1 / 16.0f; if (w1 < 1e-6f) w1 = 1e-6f;
+            float s = 0.0f;
+            for (int j = 0; j < 32; j++) s += qw[b*32 + j];
+            float w = s / 32.0f;
+            if (w < 1e-6f) w = 1e-6f;
+            w0 = w; w1 = w;
         }
         float rms0=0,rms1=0;
         for(int j=0;j<16;j++) rms0+=buf[j]*buf[j];
