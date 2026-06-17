@@ -753,8 +753,7 @@ static int tq4_0_choose_index(float val) {
 
 /* ---------- TQ3_1S quantization ---------- */
 
-static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s * GGML_RESTRICT y,
-                                       int64_t k, const float * GGML_RESTRICT qw) {
+void quantize_row_tq3_1s_ref(const float * GGML_RESTRICT x, block_tq3_1s * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TQ3_0 == 0);
     const int nb = k / QK_TQ3_0;
 
@@ -767,16 +766,6 @@ static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s
         memcpy(buf, src_blk, TQ_BLOCK_SIZE * sizeof(float));
         tq3_0_rht_forward(buf);
 
-        /* Block-scalar imatrix weights (WHT mixes all 32 elems -> per-element I meaningless) */
-        float w0 = 1.0f, w1 = 1.0f;
-        if (qw) {
-            float s0 = 0.0f, s1 = 0.0f;
-            for (int j = 0; j < 16; j++) s0 += qw[block*32 + j];
-            for (int j = 16; j < 32; j++) s1 += qw[block*32 + j];
-            w0 = s0 / 16.0f; if (w0 < 1e-6f) w0 = 1e-6f;
-            w1 = s1 / 16.0f; if (w1 < 1e-6f) w1 = 1e-6f;
-        }
-
         /* 2. Split into two halves, compute RMS per half */
         float rms0 = 0.0f, rms1 = 0.0f;
         for (int j = 0; j < 16; j++) rms0 += buf[j] * buf[j];
@@ -784,7 +773,7 @@ static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s
         rms0 = sqrtf(rms0 / 16.0f);
         rms1 = sqrtf(rms1 / 16.0f);
 
-        /* 3. Scale search (9 points) — weighted MSE */
+        /* 3. Scale search (9 points) */
         static const float scales[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
         float best_d0 = rms0, best_d1 = rms1;
         float best_err = 1e30f;
@@ -799,12 +788,12 @@ static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s
             for (int j = 0; j < 16; j++) {
                 int idx = tq3_0_choose_index(buf[j] * inv0);
                 float diff = buf[j] - TQ3_0_CENTROIDS[idx] * d0;
-                err += w0 * diff * diff;
+                err += diff * diff;
             }
             for (int j = 16; j < 32; j++) {
                 int idx = tq3_0_choose_index(buf[j] * inv1);
                 float diff = buf[j] - TQ3_0_CENTROIDS[idx] * d1;
-                err += w1 * diff * diff;
+                err += diff * diff;
             }
             if (err < best_err) {
                 best_err = err;
@@ -813,7 +802,7 @@ static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s
             }
         }
 
-        /* 4. Iterative refinement (6 iterations) — weighted LS */
+        /* 4. Iterative refinement (6 iterations) */
         for (int iter = 0; iter < 6; iter++) {
             float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
             float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
@@ -823,14 +812,14 @@ static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s
             for (int j = 0; j < 16; j++) {
                 int idx = tq3_0_choose_index(buf[j] * inv0);
                 float c = TQ3_0_CENTROIDS[idx];
-                num0 += w0 * buf[j] * c;
-                den0 += w0 * c * c;
+                num0 += buf[j] * c;
+                den0 += c * c;
             }
             for (int j = 16; j < 32; j++) {
                 int idx = tq3_0_choose_index(buf[j] * inv1);
                 float c = TQ3_0_CENTROIDS[idx];
-                num1 += w1 * buf[j] * c;
-                den1 += w1 * c * c;
+                num1 += buf[j] * c;
+                den1 += c * c;
             }
             if (den0 > 1e-10f) best_d0 = num0 / den0;
             if (den1 > 1e-10f) best_d1 = num1 / den1;
@@ -858,10 +847,6 @@ static void quantize_row_tq3_1s_impl(const float * GGML_RESTRICT x, block_tq3_1s
             qp[2] = ((indices[5] >> 1) & 3) | ((indices[6] & 7) << 2) | ((indices[7] & 7) << 5);
         }
     }
-}
-
-void quantize_row_tq3_1s_ref(const float * GGML_RESTRICT x, block_tq3_1s * GGML_RESTRICT y, int64_t k) {
-    quantize_row_tq3_1s_impl(x, y, k, NULL);
 }
 
 void dequantize_row_tq3_1s(const block_tq3_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -902,15 +887,15 @@ void dequantize_row_tq3_1s(const block_tq3_1s * GGML_RESTRICT x, float * GGML_RE
 
 size_t quantize_tq3_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
     assert(n_per_row % QK_TQ3_0 == 0);
 
     size_t row_size = (n_per_row / QK_TQ3_0) * sizeof(block_tq3_1s);
     for (int64_t row = 0; row < nrows; row++) {
-        quantize_row_tq3_1s_impl(
+        quantize_row_tq3_1s_ref(
             src + row * n_per_row,
             (block_tq3_1s *)((char *)dst + row * row_size),
-            n_per_row,
-            imatrix
+            n_per_row
         );
     }
     return nrows * row_size;
@@ -918,8 +903,7 @@ size_t quantize_tq3_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
 
 /* ---------- TQ4_1S quantization ---------- */
 
-static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s * GGML_RESTRICT y,
-                                       int64_t k, const float * GGML_RESTRICT qw) {
+void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1s * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TQ4_1S == 0);
     const int nb = k / QK_TQ4_1S;
 
@@ -932,16 +916,6 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
         memcpy(buf, src_blk, TQ_BLOCK_SIZE * sizeof(float));
         tq3_0_rht_forward(buf);
 
-        /* Block-scalar imatrix weights (WHT mixes all 32 elems -> per-element I meaningless) */
-        float w0 = 1.0f, w1 = 1.0f;
-        if (qw) {
-            float s0 = 0.0f, s1 = 0.0f;
-            for (int j = 0; j < 16; j++) s0 += qw[block*32 + j];
-            for (int j = 16; j < 32; j++) s1 += qw[block*32 + j];
-            w0 = s0 / 16.0f; if (w0 < 1e-6f) w0 = 1e-6f;
-            w1 = s1 / 16.0f; if (w1 < 1e-6f) w1 = 1e-6f;
-        }
-
         /* 2. Split into two halves, compute RMS per half */
         float rms0 = 0.0f, rms1 = 0.0f;
         for (int j = 0; j < 16; j++) rms0 += buf[j] * buf[j];
@@ -949,7 +923,7 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
         rms0 = sqrtf(rms0 / 16.0f);
         rms1 = sqrtf(rms1 / 16.0f);
 
-        /* 3. Scale search (9 points) — weighted MSE */
+        /* 3. Scale search (9 points) */
         static const float scales[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
         float best_d0 = rms0, best_d1 = rms1;
         float best_err = 1e30f;
@@ -964,12 +938,12 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
             for (int j = 0; j < 16; j++) {
                 int idx = tq4_0_choose_index(buf[j] * inv0);
                 float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d0;
-                err += w0 * diff * diff;
+                err += diff * diff;
             }
             for (int j = 16; j < 32; j++) {
                 int idx = tq4_0_choose_index(buf[j] * inv1);
                 float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d1;
-                err += w1 * diff * diff;
+                err += diff * diff;
             }
             if (err < best_err) {
                 best_err = err;
@@ -978,7 +952,7 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
             }
         }
 
-        /* 4. Iterative refinement (6 iterations) — weighted LS */
+        /* 4. Iterative refinement (6 iterations) */
         for (int iter = 0; iter < 6; iter++) {
             float inv0 = (best_d0 > 1e-10f) ? 1.0f / best_d0 : 0.0f;
             float inv1 = (best_d1 > 1e-10f) ? 1.0f / best_d1 : 0.0f;
@@ -988,14 +962,14 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
             for (int j = 0; j < 16; j++) {
                 int idx = tq4_0_choose_index(buf[j] * inv0);
                 float c = TQ4_0_CENTROIDS[idx];
-                num0 += w0 * buf[j] * c;
-                den0 += w0 * c * c;
+                num0 += buf[j] * c;
+                den0 += c * c;
             }
             for (int j = 16; j < 32; j++) {
                 int idx = tq4_0_choose_index(buf[j] * inv1);
                 float c = TQ4_0_CENTROIDS[idx];
-                num1 += w1 * buf[j] * c;
-                den1 += w1 * c * c;
+                num1 += buf[j] * c;
+                den1 += c * c;
             }
             if (den0 > 1e-10f) best_d0 = num0 / den0;
             if (den1 > 1e-10f) best_d1 = num1 / den1;
@@ -1015,10 +989,6 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
             blk->qs[j / 2] |= (uint8_t)((idx & 0xF) << ((j & 1) * 4));
         }
     }
-}
-
-void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1s * GGML_RESTRICT y, int64_t k) {
-    quantize_row_tq4_1s_impl(x, y, k, NULL);
 }
 
 void dequantize_row_tq4_1s(const block_tq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -1045,89 +1015,16 @@ void dequantize_row_tq4_1s(const block_tq4_1s * GGML_RESTRICT x, float * GGML_RE
 
 size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
     assert(n_per_row % QK_TQ4_1S == 0);
 
     size_t row_size = (n_per_row / QK_TQ4_1S) * sizeof(block_tq4_1s);
     for (int64_t row = 0; row < nrows; row++) {
-        quantize_row_tq4_1s_impl(
+        quantize_row_tq4_1s_ref(
             src + row * n_per_row,
             (block_tq4_1s *)((char *)dst + row * row_size),
-            n_per_row,
-            imatrix
+            n_per_row
         );
     }
     return nrows * row_size;
-}
-
-/* ---------- TQ2_1S ---------- */
-static const float TQ2_1S_CENTROIDS[4] = { -1.5f, -0.5f, 0.5f, 1.5f };
-static int tq2_1s_choose_index(float v) {
-    if (v < -1.0f) return 0;
-    if (v <  0.0f) return 1;
-    if (v <  1.0f) return 2;
-    return 3;
-}
-static void quantize_row_tq2_1s_impl(const float * GGML_RESTRICT x, block_tq2_1s * GGML_RESTRICT y,
-                                       int64_t k, const float * GGML_RESTRICT qw) {
-    assert(k % QK_TQ2_1S == 0);
-    const int nb = k / QK_TQ2_1S;
-    for (int b = 0; b < nb; b++) {
-        float buf[32];
-        memcpy(buf, x + b*32, 32*sizeof(float));
-        tq3_0_rht_forward(buf);
-        // Block-scalar imatrix weights (WHT mixes all 32 elems -> per-element I meaningless)
-        float w0 = 1.0f, w1 = 1.0f;
-        if (qw) {
-            float s0 = 0.0f, s1 = 0.0f;
-            for (int j = 0; j < 16; j++) s0 += qw[b*32 + j];
-            for (int j = 16; j < 32; j++) s1 += qw[b*32 + j];
-            w0 = s0 / 16.0f; if (w0 < 1e-6f) w0 = 1e-6f;
-            w1 = s1 / 16.0f; if (w1 < 1e-6f) w1 = 1e-6f;
-        }
-        float rms0=0,rms1=0;
-        for(int j=0;j<16;j++) rms0+=buf[j]*buf[j];
-        for(int j=16;j<32;j++) rms1+=buf[j]*buf[j];
-        rms0=sqrtf(rms0/16); rms1=sqrtf(rms1/16);
-        float bd0=rms0,bd1=rms1,be=1e30f;
-        static const float sc[]={0.6f,0.7f,0.8f,0.9f,1.0f,1.1f,1.2f,1.35f,1.5f};
-        for(int si=0;si<9;si++){
-            float d0=rms0*sc[si],d1=rms1*sc[si];
-            float i0=d0>1e-10f?1/d0:0,i1=d1>1e-10f?1/d1:0,e=0;
-            for(int j=0;j<16;j++){int id=tq2_1s_choose_index(buf[j]*i0);float d=buf[j]-TQ2_1S_CENTROIDS[id]*d0;e+=w0*d*d;}
-            for(int j=16;j<32;j++){int id=tq2_1s_choose_index(buf[j]*i1);float d=buf[j]-TQ2_1S_CENTROIDS[id]*d1;e+=w1*d*d;}
-            if(e<be){be=e;bd0=d0;bd1=d1;}
-        }
-        for(int it=0;it<6;it++){
-            float i0=bd0>1e-10f?1/bd0:0,i1=bd1>1e-10f?1/bd1:0,n0=0,d0=0,n1=0,d1=0;
-            for(int j=0;j<16;j++){int id=tq2_1s_choose_index(buf[j]*i0);float c=TQ2_1S_CENTROIDS[id];n0+=w0*buf[j]*c;d0+=w0*c*c;}
-            for(int j=16;j<32;j++){int id=tq2_1s_choose_index(buf[j]*i1);float c=TQ2_1S_CENTROIDS[id];n1+=w1*buf[j]*c;d1+=w1*c*c;}
-            if(d0>1e-10f)bd0=n0/d0;
-            if(d1>1e-10f)bd1=n1/d1;
-        }
-        y[b].d0=GGML_FP32_TO_FP16(bd0); y[b].d1=GGML_FP32_TO_FP16(bd1);
-        memset(y[b].qs,0,8);
-        float i0=bd0>1e-10f?1/bd0:0,i1=bd1>1e-10f?1/bd1:0;
-        for(int j=0;j<32;j++){int id=tq2_1s_choose_index(buf[j]*((j<16)?i0:i1));y[b].qs[j>>2]|=((uint8_t)(id&3))<<((j&3)*2);}
-    }
-}
-
-void quantize_row_tq2_1s_ref(const float * GGML_RESTRICT x, block_tq2_1s * GGML_RESTRICT y, int64_t k) {
-    quantize_row_tq2_1s_impl(x, y, k, NULL);
-}
-void dequantize_row_tq2_1s(const block_tq2_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TQ2_1S == 0);
-    const int nb = k / QK_TQ2_1S;
-    for(int b=0;b<nb;b++){
-        float d0=GGML_FP16_TO_FP32(x[b].d0), d1=GGML_FP16_TO_FP32(x[b].d1);
-        float buf[32];
-        for(int j=0;j<32;j++){int idx=(x[b].qs[j>>2]>>((j&3)*2))&3;buf[j]=TQ2_1S_CENTROIDS[idx]*((j<16)?d0:d1);}
-        tq3_0_rht_inverse(buf);
-        memcpy(y+b*32,buf,32*sizeof(float));
-    }
-}
-size_t quantize_tq2_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    assert(n_per_row % QK_TQ2_1S == 0);
-    size_t rs=(n_per_row/QK_TQ2_1S)*sizeof(block_tq2_1s);
-    for(int64_t r=0;r<nrows;r++) quantize_row_tq2_1s_impl(src+r*n_per_row,(block_tq2_1s*)((char*)dst+r*rs),n_per_row,imatrix);
-    return nrows*rs;
 }

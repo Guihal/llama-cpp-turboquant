@@ -7800,10 +7800,7 @@ bool ggml_quantize_requires_imatrix(enum ggml_type type) {
     return
         type == GGML_TYPE_IQ2_XXS ||
         type == GGML_TYPE_IQ2_XS  ||
-        type == GGML_TYPE_IQ1_S   ||
-        type == GGML_TYPE_TQ2_1S  ||
-        type == GGML_TYPE_TQ3_1S  ||
-        type == GGML_TYPE_TQ4_1S;//   ||
+        type == GGML_TYPE_IQ1_S;//   ||
         //type == GGML_TYPE_IQ1_M;
 }
 
