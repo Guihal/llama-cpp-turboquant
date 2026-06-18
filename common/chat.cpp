@@ -1363,7 +1363,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
 
         // Note: this model is CRAZY. It can diverge from its supposed tool calling pattern in so many ways it's not funny.
         // For example, it can call tools at the end of reasoning without closing reasoning...
-        auto reasoning = extract_reasoning ? p.optional(THINK_START + p.reasoning(
+        auto reasoning = extract_reasoning ? p.optional(p.space() + THINK_START + p.reasoning(
             p.until_one_of({ THINK_END, "<|tool_calls_section_begin|>", "<|tool_call_begin|>" })) +
             p.optional(p.literal(THINK_END))) : p.eps();
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
@@ -1471,7 +1471,7 @@ static common_chat_params common_chat_params_init_lfm2(const common_chat_templat
 
         auto reasoning = p.eps();
         if (extract_reasoning && inputs.enable_thinking) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            reasoning = p.optional(p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         }
 
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -1546,7 +1546,7 @@ static common_chat_params common_chat_params_init_lfm2_5(const common_chat_templ
 
         auto reasoning = p.eps();
         if (extract_reasoning && inputs.enable_thinking) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            reasoning = p.optional(p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         }
 
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -1580,6 +1580,151 @@ static common_chat_params common_chat_params_init_lfm2_5(const common_chat_templ
             const std::string name = tool.at("function").at("name");
             data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "[" + name + "(" });
         });
+    }
+
+    return data;
+}
+
+// ZAYA / Zyphra format:
+// - ChatML-style turns: <|im_start|>assistant\n ... <|im_end|>
+// - Reasoning: <think>{reasoning}</think>
+// - Tool calls:
+//   <zyphra_tool_call>
+//   <function=name>
+//   <parameter=arg>
+//   value
+//   </parameter>
+//   </function>
+//   </zyphra_tool_call>
+static common_chat_params common_chat_params_init_zaya(const common_chat_template &    tmpl,
+                                                       const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+    data.preserved_tokens  = {
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "<zyphra_tool_call>",
+        "</zyphra_tool_call>",
+        "<zyphra_tool_response>",
+        "</zyphra_tool_response>",
+        "<function=",
+        "</function>",
+        "<parameter=",
+        "</parameter>",
+    };
+
+    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
+    const std::string IM_END      = "<|im_end|>";
+    const std::string THINK_START = "<think>";
+    const std::string THINK_END   = "</think>";
+    const std::string ZTC_START   = "<zyphra_tool_call>";
+    const std::string ZTC_END     = "</zyphra_tool_call>";
+    const std::string FUNC_END    = "</function>";
+    const std::string PARAM_END   = "</parameter>";
+
+    data.thinking_start_tag = THINK_START;
+    data.thinking_end_tag   = THINK_END;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
+        auto end = p.optional(p.literal(IM_END)) + p.end();
+
+        auto reasoning = p.eps();
+        if (extract_reasoning && inputs.enable_thinking) {
+            reasoning = p.optional(
+                p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END + p.space());
+        } else if (extract_reasoning) {
+            reasoning = p.optional(p.space() + THINK_START + p.until(THINK_END) + THINK_END + p.space());
+        }
+
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return generation_prompt + reasoning + p.content(p.until(IM_END)) + end;
+        }
+
+        auto tool_choice = p.choice();
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            std::string  name     = function.at("name");
+            auto         params   = function.contains("parameters") ? function.at("parameters") : json::object();
+            const auto & props    = params.contains("properties") ? params.at("properties") : json::object();
+
+            auto schema_info = common_schema_info();
+            schema_info.resolve_refs(params);
+
+            std::vector<common_peg_parser> arg_parsers;
+            for (const auto & [param_name, param_schema] : props.items()) {
+                bool is_string = schema_info.resolves_to_string(param_schema);
+
+                auto arg = p.tool_arg(
+                    p.tool_arg_open(
+                        p.literal("<parameter=") +
+                        p.tool_arg_name(p.literal(param_name)) +
+                        p.literal(">")) +
+                    p.space() +
+                    (is_string
+                        ? p.tool_arg_string_value(p.until(PARAM_END))
+                        : p.tool_arg_json_value(p.schema(p.json(),
+                                                         "tool-" + name + "-arg-" + param_name + "-schema",
+                                                         param_schema, false))) +
+                    p.tool_arg_close(p.literal(PARAM_END)));
+
+                arg_parsers.push_back(p.rule("tool-" + name + "-arg-" + param_name, arg));
+            }
+
+            common_peg_parser args_seq = p.eps();
+            if (!arg_parsers.empty()) {
+                auto any_arg = p.choice();
+                for (const auto & arg : arg_parsers) {
+                    any_arg |= arg;
+                }
+                args_seq = p.repeat(p.space() + any_arg, 0, -1);
+            }
+
+            auto func_parser = p.tool(
+                p.tool_open(
+                    p.literal("<function=") +
+                    p.tool_name(p.literal(name)) +
+                    p.literal(">")) +
+                args_seq + p.space() +
+                p.tool_close(p.literal(FUNC_END)));
+
+            tool_choice |= p.rule("tool-" + name, func_parser);
+        });
+
+        auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+        auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+        auto tool_calls = p.trigger_rule("tool-call",
+            p.repeat(p.literal(ZTC_START) + p.space() + tool_choice + p.space() + p.literal(ZTC_END),
+                     min_calls, max_calls));
+
+        auto content_before_tools = p.content(p.until_one_of({ ZTC_START, IM_END }));
+        return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
+                builder.resolve_refs(schema);
+            });
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        data.grammar_triggers = {
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, ZTC_START }
+        };
     }
 
     return data;
@@ -1694,11 +1839,11 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
 
         auto reasoning = p.eps();
         if (extract_reasoning && inputs.enable_thinking) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            reasoning = p.optional(p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         } else if (extract_reasoning) {
             // Thinking disabled but reasoning extraction requested: the generation prompt
             // contains an empty <think></think> pair that must still be consumed.
-            reasoning = p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
+            reasoning = p.optional(p.space() + p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
         }
 
         if (has_response_format) {
@@ -2083,6 +2228,16 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|tool_list_start|>") == std::string::npos) {
         LOG_DBG("Using specialized template: LFM2.5\n");
         return common_chat_params_init_lfm2_5(tmpl, params);
+    }
+
+    // ZAYA / Zyphra format detection: ChatML turns with <think> reasoning and Zyphra XML tool calls.
+    if (src.find("<|im_start|>assistant") != std::string::npos &&
+        src.find("<think>") != std::string::npos &&
+        src.find("<zyphra_tool_call>") != std::string::npos &&
+        src.find("<function=") != std::string::npos &&
+        src.find("<parameter=") != std::string::npos) {
+        LOG_DBG("Using specialized template: ZAYA/Zyphra\n");
+        return common_chat_params_init_zaya(tmpl, params);
     }
 
     // GigaChatV3 format detection

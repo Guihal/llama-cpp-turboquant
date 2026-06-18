@@ -21,6 +21,7 @@ static void test_example_qwen3_non_coder(testing & t);
 static void test_command7_parser_compare(testing & t);
 static void test_prefix_tool_names(testing & t);
 static void test_tagged_peg_parser(testing & t);
+static void test_zaya_reasoning_parser(testing & t);
 
 int main(int argc, char * argv[]) {
     testing t(std::cout);
@@ -39,6 +40,7 @@ int main(int argc, char * argv[]) {
     t.test("comparison", test_command7_parser_compare);
     t.test("prefix tool names", test_prefix_tool_names);
     t.test("tagged peg parser", test_tagged_peg_parser);
+    t.test("zaya reasoning parser", test_zaya_reasoning_parser);
 
     return t.summary();
 }
@@ -120,6 +122,96 @@ static json create_tools() {
     tools.push_back(tool_search);
 
     return tools;
+}
+
+static common_chat_parser_params make_parser_params(const common_chat_params & chat_params) {
+    common_chat_parser_params parser_params(chat_params);
+    parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    parser_params.parser.load(chat_params.parser);
+    return parser_params;
+}
+
+static common_chat_params make_zaya_chat_params(bool with_tools = false) {
+    const std::string zaya_template =
+        "{# <zyphra_tool_call> <function=example> <parameter=arg> #}"
+        "{%- for message in messages %}"
+        "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}"
+        "{%- endfor %}"
+        "{%- if add_generation_prompt %}"
+        "{{- '<|im_start|>assistant\\n<think>\\n' -}}"
+        "{%- endif %}";
+
+    auto tmpls = common_chat_templates_init(nullptr, zaya_template);
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "Ответь одним словом: столица Франции?";
+
+    common_chat_templates_inputs inputs;
+    inputs.messages         = { user };
+    inputs.use_jinja        = true;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    inputs.enable_thinking  = true;
+    if (with_tools) {
+        inputs.tools = common_chat_tools_parse_oaicompat(create_tools());
+    }
+
+    return common_chat_templates_apply(tmpls.get(), inputs);
+}
+
+static void assert_zaya_response(testing & t,
+                                 const common_chat_parser_params & parser_params,
+                                 const std::string & input) {
+    auto msg = common_chat_parse(input, false, parser_params);
+
+    t.assert_true("reasoning should be extracted", !msg.reasoning_content.empty());
+    t.assert_true("reasoning should contain body", msg.reasoning_content.find("reason") != std::string::npos);
+    t.assert_equal("content should be clean", "Париж.", msg.content);
+    t.assert_true("content should not leak <think>", msg.content.find("<think>") == std::string::npos);
+}
+
+static void test_zaya_reasoning_parser(testing & t) {
+    auto chat_params = make_zaya_chat_params();
+
+    t.assert_true("specialized parser should be present", !chat_params.parser.empty());
+    t.assert_equal("generation prompt", "<|im_start|>assistant\n<think>\n", chat_params.generation_prompt);
+
+    auto parser_params = make_parser_params(chat_params);
+
+    // Full generated message shape, useful for direct parser tests and logs.
+    auto full_params = parser_params;
+    full_params.generation_prompt.clear();
+    assert_zaya_response(t, full_params, "<|im_start|>assistant\n<think>\nreason\n</think>\n\nПариж.");
+
+    // Runtime shape: common_chat_parse prepends chat_params.generation_prompt to generated text.
+    assert_zaya_response(t, parser_params, "reason\n</think>\n\nПариж.");
+
+    // Some models emit a separator newline before opening reasoning.
+    auto newline_params = parser_params;
+    newline_params.generation_prompt = "<|im_start|>assistant\n";
+    assert_zaya_response(t, newline_params, "\n<think>\nreason\n</think>\n\nПариж.");
+
+    auto tool_chat_params = make_zaya_chat_params(true);
+    auto tool_parser_params = make_parser_params(tool_chat_params);
+    auto tool_msg = common_chat_parse(
+        "reason\n</think>\n\n"
+        "<zyphra_tool_call>\n"
+        "<function=get_current_weather>\n"
+        "<parameter=location>\nParis\n</parameter>\n"
+        "<parameter=unit>\ncelsius\n</parameter>\n"
+        "</function>\n"
+        "</zyphra_tool_call>",
+        false,
+        tool_parser_params);
+    t.assert_true("tool reasoning should be extracted", !tool_msg.reasoning_content.empty());
+    t.assert_equal("tool content should be empty", "", tool_msg.content);
+    t.assert_equal("tool calls count", 1u, tool_msg.tool_calls.size());
+    if (!tool_msg.tool_calls.empty()) {
+        t.assert_equal("tool name", "get_current_weather", tool_msg.tool_calls[0].name);
+        auto args = json::parse(tool_msg.tool_calls[0].arguments);
+        t.assert_equal("tool location", "Paris", args.at("location").get<std::string>());
+        t.assert_equal("tool unit", "celsius", args.at("unit").get<std::string>());
+    }
 }
 
 struct tool_argument {

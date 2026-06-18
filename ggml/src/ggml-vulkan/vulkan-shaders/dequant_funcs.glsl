@@ -1,7 +1,6 @@
 #if !defined(DATA_A_F32) && !defined(DATA_A_F16)
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #endif
-
 #include "types.glsl"
 
 #if defined(DATA_A_F32)
@@ -723,6 +722,69 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 vec2 get_dm(uint ib, uint a_offset) {
     // No global scale/min — scales are applied per-element in dequantize()
+    return vec2(1, 0);
+}
+#endif
+
+// ------------------------ TQ3_1S ------------------------
+#if defined(DATA_A_TQ3_1S)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const float centroids[8] = float[8](
+        -1.996684, -1.291398, -0.740341, -0.247508,
+         0.247508,  0.740341,  1.291398,  1.996684
+    );
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+    uint byte0 = (j0 * 3) / 8;
+    uint bit0 = (j0 * 3) % 8;
+    uint idx0 = (uint(data_a[a_offset + ib].qs[byte0]) >> bit0) & 0xFF;
+    if (bit0 + 3 > 8) {
+        idx0 |= (uint(data_a[a_offset + ib].qs[byte0 + 1]) << (8 - bit0)) & 0xFF;
+    }
+    idx0 = idx0 & 0x7;
+    uint byte1 = (j1 * 3) / 8;
+    uint bit1 = (j1 * 3) % 8;
+    uint idx1 = (uint(data_a[a_offset + ib].qs[byte1]) >> bit1) & 0xFF;
+    if (bit1 + 3 > 8) {
+        idx1 |= (uint(data_a[a_offset + ib].qs[byte1 + 1]) << (8 - bit1)) & 0xFF;
+    }
+    idx1 = idx1 & 0x7;
+    const float d0 = float(data_a[a_offset + ib].d0);
+    const float d1 = float(data_a[a_offset + ib].d1);
+    const float s0 = (j0 < 16) ? d0 : d1;
+    const float s1 = (j1 < 16) ? d0 : d1;
+    return vec2(centroids[idx0] * s0, centroids[idx1] * s1);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(1, 0);
+}
+#endif
+
+// ------------------------ TQ2_1S ------------------------
+#if defined(DATA_A_TQ2_1S)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const float centroids[4] = float[4](-1.5, -0.5, 0.5, 1.5);
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+    uint idx0 = (uint(data_a[a_offset + ib].qs[j0 / 4]) >> ((j0 & 3) * 2)) & 0x3;
+    uint idx1 = (uint(data_a[a_offset + ib].qs[j1 / 4]) >> ((j1 & 3) * 2)) & 0x3;
+    const float d0 = float(data_a[a_offset + ib].d0);
+    const float d1 = float(data_a[a_offset + ib].d1);
+    const float s0 = (j0 < 16) ? d0 : d1;
+    const float s1 = (j1 < 16) ? d0 : d1;
+    return vec2(centroids[idx0] * s0, centroids[idx1] * s1);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
     return vec2(1, 0);
 }
 #endif

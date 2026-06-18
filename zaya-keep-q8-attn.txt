@@ -1,0 +1,9 @@
+.*cca_val_proj1.*=Q8_0
+.*cca_val_proj2.*=Q8_0
+.*cca_k_scale.*=Q8_0
+.*zaya_router.*=Q8_0
+^blk\.\d+\.ffn_gate\.weight=Q8_0
+.*ffn_gate_inp\.bias.*=Q8_0
+.*attn_q\.weight=Q8_0
+.*attn_k\.weight=Q8_0
+.*attn_output\.weight=Q8_0

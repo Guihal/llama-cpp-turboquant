@@ -368,6 +368,16 @@ typedef struct {
 } block_tq4_1s;                         // 20 bytes total
 static_assert(sizeof(block_tq4_1s) == 20, "wrong tq4_1s block size");
 
+// TQ2_1S: WHT-rotated 2-bit weight quantization (4-level Lloyd-Max for N(0,1))
+// Block size 32, dual half-block scales
+#define QK_TQ2_1S 32
+typedef struct {
+    ggml_half d0;
+    ggml_half d1;
+    uint8_t   qs[QK_TQ2_1S * 2 / 8]; // 8 bytes: 2-bit packed indices
+} block_tq2_1s;                         // 12 bytes
+static_assert(sizeof(block_tq2_1s) == 12, "wrong tq2_1s block size");
+
 //
 // Super-block quantization structures
 //

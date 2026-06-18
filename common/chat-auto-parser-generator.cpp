@@ -135,8 +135,9 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
         if (!end.empty()) {
             if (!start.empty()) {
-                // Standard tag-based: optional(<think>reasoning</think>)
-                return p.optional(p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
+                // Standard tag-based: optional(<think>reasoning</think>).
+                // Some models emit a newline before the reasoning start tag.
+                return p.optional(p.space() + p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
             }
             // Delimiter-style (empty start)
             return p.optional(p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));

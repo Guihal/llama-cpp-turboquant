@@ -8507,6 +8507,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // TQ2_1S / TQ3_1S: large-batch MUL_MAT, mirrors the TQ4_1S loop above.
+    // Closes the §7.2 Lovelace coverage gap: TQ4 had a dequant+matmul n>8
+    // test path, TQ2/TQ3 did not. Same n>8 boundary forces the dequant+f16
+    // matmul pipeline instead of the fused mul_mat_vec kernel.
+    for (int k : { 1536, 2048 }) {
+        for (int m : { 256, 1536, 2048 }) {
+            for (int n : { 16, 64, 256 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -8690,6 +8703,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 16, 2, false, m, n, k));
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 16, 2, false, m, n, k));
             }
+        }
+    }
+
+    // TQ2_1S / TQ3_1S / TQ4_1S: ZAYA MoE production shape. m=8192, k=2048
+    // mirrors the ffn_gate_up_exps weight layout, and n_used=1 mirrors the
+    // top-1 ZAYA router (the existing loop above is hardcoded n_used=2).
+    // Closes §7.2 Lovelace high-priority coverage gap.
+    for (ggml_type type_a : { GGML_TYPE_TQ2_1S, GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S }) {
+        for (int n : { 1, 4, 16 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 1, false, 8192, n, 2048));
         }
     }
 
