@@ -212,6 +212,25 @@ static void test_zaya_reasoning_parser(testing & t) {
         t.assert_equal("tool location", "Paris", args.at("location").get<std::string>());
         t.assert_equal("tool unit", "celsius", args.at("unit").get<std::string>());
     }
+
+    // Bare form: <function=...>...</function> WITHOUT the <zyphra_tool_call> wrapper.
+    // Regression for TQ4-quantized ZAYA emitting bare tool calls (pi-smoke CURRENT-STATE-7/8).
+    auto bare_msg = common_chat_parse(
+        "reason\n</think>\n\n"
+        "<function=get_current_weather>\n"
+        "<parameter=location>\nParis\n</parameter>\n"
+        "<parameter=unit>\ncelsius\n</parameter>\n"
+        "</function>",
+        false,
+        tool_parser_params);
+    t.assert_true("bare tool reasoning should be extracted", !bare_msg.reasoning_content.empty());
+    t.assert_equal("bare tool calls count", 1u, bare_msg.tool_calls.size());
+    if (!bare_msg.tool_calls.empty()) {
+        t.assert_equal("bare tool name", "get_current_weather", bare_msg.tool_calls[0].name);
+        auto bare_args = json::parse(bare_msg.tool_calls[0].arguments);
+        t.assert_equal("bare tool location", "Paris", bare_args.at("location").get<std::string>());
+        t.assert_equal("bare tool unit", "celsius", bare_args.at("unit").get<std::string>());
+    }
 }
 
 struct tool_argument {

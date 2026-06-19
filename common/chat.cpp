@@ -1701,11 +1701,18 @@ static common_chat_params common_chat_params_init_zaya(const common_chat_templat
 
         auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
         auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+        // TQ4-quantized ZAYA often emits bare <function=...>...</function> WITHOUT the
+        // <zyphra_tool_call> wrapper (see pi-smoke CURRENT-STATE-7/8). Accept both shapes.
+        auto one_call = p.choice();
+        one_call |= (p.literal(ZTC_START) + p.space() + tool_choice + p.space() + p.literal(ZTC_END));
+        one_call |= tool_choice;  // bare <function=...>...</function>
         auto tool_calls = p.trigger_rule("tool-call",
-            p.repeat(p.literal(ZTC_START) + p.space() + tool_choice + p.space() + p.literal(ZTC_END),
-                     min_calls, max_calls));
+            p.repeat(one_call, min_calls, max_calls));
 
-        auto content_before_tools = p.content(p.until_one_of({ ZTC_START, IM_END }));
+        // ponytail: literal "<function=NAME>" in non-tool prose, or a malformed bare call,
+        // makes common_chat_parse throw on full (non-partial) parse. Acceptable for pi
+        // tool-call mode; partial/streaming parse is lenient. Revisit if prose appears.
+        auto content_before_tools = p.content(p.until_one_of({ ZTC_START, "<function=", IM_END }));
         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });
 
@@ -1723,7 +1730,8 @@ static common_chat_params common_chat_params_init_zaya(const common_chat_templat
         });
 
         data.grammar_triggers = {
-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, ZTC_START }
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, ZTC_START },
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<function=" },
         };
     }
 
