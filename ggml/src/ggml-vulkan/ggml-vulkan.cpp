@@ -4318,6 +4318,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
     const bool     tq4_1s_use_subgroups      = false;
     const shader_reduction_mode tq4_1s_reduc = SHADER_REDUCTION_MODE_SHMEM;
     const bool     tq4_1s_align              = true;
+    // ponytail: Path F (cache-line coalesced matvec, decode only). 64-thread wave64 reads
+    // 32 bytes qs per super-iter (2 TQ4 blocks). Used ONLY for i==0 (NUM_COLS=1) when the
+    // device supports subgroup_size_control with maxSubgroupSize>=64; otherwise fall back to
+    // the original 32-thread SHMEM pipeline.
+    const uint32_t tq4_1s_decode_wg_size         = 64u;
+    const uint32_t tq4_1s_decode_force_sg_size   = 64u;
+    const bool     tq4_1s_decode_use_subgroups    = true;
+    const shader_reduction_mode tq4_1s_decode_reduc = SHADER_REDUCTION_MODE_SUBGROUP;
     const uint32_t tq3_1s_wg_size            = 32u;
     const uint32_t tq3_1s_force_sg_size      = 0u;
     const bool     tq3_1s_use_subgroups      = false;
@@ -4369,8 +4377,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f32_f32",  arr_dmmv_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f32_f32",   arr_dmmv_mxfp4_f32_f32_len[reduc16],   arr_dmmv_mxfp4_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f32_f32",   arr_dmmv_nvfp4_f32_f32_len[reduc16],   arr_dmmv_nvfp4_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
-            // TQ4_1S f32: fixed 32-thread workgroup, shared-memory WHT butterfly.
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f32_f32",  arr_dmmv_tq4_1s_f32_f32_len[tq4_1s_reduc],  arr_dmmv_tq4_1s_f32_f32_data[tq4_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_wg_size, 8, i+1}, 1, true, tq4_1s_use_subgroups, tq4_1s_force_sg_size);
+            // TQ4_1S f32: decode (i==0) uses 64-thread cacheline-coalesced + subgroup reduction;
+            // NUM_COLS>1 keeps the original 32-thread SHMEM path. Non-capable devices fall back.
+            if (i == 0 && device->subgroup_size_control && device->subgroup_size >= tq4_1s_decode_wg_size) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f32_f32",  arr_dmmv_tq4_1s_f32_f32_len[tq4_1s_decode_reduc],  arr_dmmv_tq4_1s_f32_f32_data[tq4_1s_decode_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_decode_wg_size, 8, i+1}, 1, true, tq4_1s_decode_use_subgroups, tq4_1s_decode_force_sg_size);
+            } else {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f32_f32",  arr_dmmv_tq4_1s_f32_f32_len[tq4_1s_reduc],  arr_dmmv_tq4_1s_f32_f32_data[tq4_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_wg_size, 8, i+1}, 1, true, tq4_1s_use_subgroups, tq4_1s_force_sg_size);
+            }
             // TQ3_1S + TQ2_1S: same pipeline parameters.
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ3_1S][i],  "mul_mat_vec_tq3_1s_f32_f32",  arr_dmmv_tq3_1s_f32_f32_len[tq3_1s_reduc],  arr_dmmv_tq3_1s_f32_f32_data[tq3_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq3_1s_wg_size, 8, i+1}, 1, true, tq3_1s_use_subgroups, tq3_1s_force_sg_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ2_1S][i],  "mul_mat_vec_tq2_1s_f32_f32",  arr_dmmv_tq2_1s_f32_f32_len[tq2_1s_reduc],  arr_dmmv_tq2_1s_f32_f32_data[tq2_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq2_1s_wg_size, 8, i+1}, 1, true, tq2_1s_use_subgroups, tq2_1s_force_sg_size);
@@ -4401,7 +4414,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f16_f32",   arr_dmmv_mxfp4_f16_f32_len[reduc16],   arr_dmmv_mxfp4_f16_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f16_f32",   arr_dmmv_nvfp4_f16_f32_len[reduc16],   arr_dmmv_nvfp4_f16_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             // TQ4_1S f16: same shader, fp16 activations.
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f16_f32",  arr_dmmv_tq4_1s_f16_f32_len[tq4_1s_reduc],  arr_dmmv_tq4_1s_f16_f32_data[tq4_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_wg_size, 8, i+1}, 1, true, tq4_1s_use_subgroups, tq4_1s_force_sg_size);
+            if (i == 0 && device->subgroup_size_control && device->subgroup_size >= tq4_1s_decode_wg_size) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f16_f32",  arr_dmmv_tq4_1s_f16_f32_len[tq4_1s_decode_reduc],  arr_dmmv_tq4_1s_f16_f32_data[tq4_1s_decode_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_decode_wg_size, 8, i+1}, 1, true, tq4_1s_decode_use_subgroups, tq4_1s_decode_force_sg_size);
+            } else {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f16_f32",  arr_dmmv_tq4_1s_f16_f32_len[tq4_1s_reduc],  arr_dmmv_tq4_1s_f16_f32_data[tq4_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_wg_size, 8, i+1}, 1, true, tq4_1s_use_subgroups, tq4_1s_force_sg_size);
+            }
             // TQ3_1S + TQ2_1S f16.
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ3_1S][i],  "mul_mat_vec_tq3_1s_f16_f32",  arr_dmmv_tq3_1s_f16_f32_len[tq3_1s_reduc],  arr_dmmv_tq3_1s_f16_f32_data[tq3_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq3_1s_wg_size, 8, i+1}, 1, true, tq3_1s_use_subgroups, tq3_1s_force_sg_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ2_1S][i],  "mul_mat_vec_tq2_1s_f16_f32",  arr_dmmv_tq2_1s_f16_f32_len[tq2_1s_reduc],  arr_dmmv_tq2_1s_f16_f32_data[tq2_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq2_1s_wg_size, 8, i+1}, 1, true, tq2_1s_use_subgroups, tq2_1s_force_sg_size);
