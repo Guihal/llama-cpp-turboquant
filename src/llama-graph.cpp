@@ -1221,6 +1221,29 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
+    // spec 041 T7: emit the fused FFN op (Vulkan decode-path) when all
+    // preconditions hold; fall through to the original decomposition otherwise.
+    // MoE is excluded by the arch guard: LLM_ARCH_QWEN35 is dense; the MoE
+    // variant is a separate arch (LLM_ARCH_QWEN35MOE) with its own graph, and
+    // build_ffn has no `layer` handle here to check ffn_gate_inp directly.
+    if (arch == LLM_ARCH_QWEN35
+        && il >= 0
+        && !hparams.is_recr((uint32_t) il)            // full-attn layers only (skip gated-delta-net)
+        && type_op   == LLM_FFN_SILU
+        && type_gate == LLM_FFN_PAR
+        && !up_b && !up_s && !gate_b && !gate_s && !down_b && !down_s && !act_scales
+        && cur && gate && up && down
+        && cur->type == GGML_TYPE_F32
+        && ubatch.n_tokens == 1
+        && cur->ne[1] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1
+        && gate->type == GGML_TYPE_TQ4_1S && up->type == GGML_TYPE_TQ4_1S && down->type == GGML_TYPE_TQ4_1S
+        && ggml_is_contiguous(gate) && ggml_is_contiguous(up) && ggml_is_contiguous(down)
+        && ggml_is_contiguous(cur)
+        && (gate->ne[0] % 32 == 0) && (gate->ne[1] % 32 == 0)
+        && (down->ne[0] % 32 == 0) && (down->ne[1] % 32 == 0)) {
+        return ggml_fused_ffn(ctx0, gate, cur, up, down);
+    }
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 

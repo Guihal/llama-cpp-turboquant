@@ -5580,9 +5580,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
 
-        // TQ4 spec 041: fused FFN path requires subgroup_size_control ext (refined) + wave64.
+        // TQ4 spec 041: fused FFN path requires subgroup_size_control ext + subgroup >= 32.
+        // shader uses 32-thread subgrouAdd reductions (local_size_x=32), so wave32 iGPUs (RDNA3 gfx1103)
+        // are supported when subgroup_size_control is present. Wave64 NVIDIA discrete GPUs also work.
         device->fused_ffn_supported = device->subgroup_size_control
-                                     && device->subgroup_size >= 64;
+                                     && device->subgroup_size >= 32;
 
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
@@ -16398,6 +16400,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_FUSED_FFN:
+            return device->fused_ffn_supported
+                && op->src[0]->type == GGML_TYPE_TQ4_1S
+                && op->src[2]->type == GGML_TYPE_TQ4_1S
+                && op->src[3]->type == GGML_TYPE_TQ4_1S
+                && op->src[1]->type == GGML_TYPE_F32
+                && op->type == GGML_TYPE_F32
+                && op->ne[1] == 1;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:

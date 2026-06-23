@@ -1365,6 +1365,19 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
+    // spec 041 T7: fused FFN sub-layer (gate+up matvecs, silu, mul, down matvec).
+    // src0=gate [hidden, ffn_hidden] TQ4_1S contiguous
+    // src1=x    [hidden, n_tokens]   F32    contiguous
+    // src2=up   [hidden, ffn_hidden] TQ4_1S contiguous
+    // src3=down [ffn_hidden, hidden] TQ4_1S contiguous
+    // dst = down @ (silu(gate@x) * (up@x))   [hidden, n_tokens] F32
+    GGML_API struct ggml_tensor * ggml_fused_ffn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * down);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,

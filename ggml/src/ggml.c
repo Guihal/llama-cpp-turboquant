@@ -3133,6 +3133,47 @@ struct ggml_tensor * ggml_swiglu_oai(
     return result;
 }
 
+// ggml_fused_ffn
+// spec 041 T7: combined FFN sub-layer (gate+up matvecs, silu(gate)*up, down matvec).
+// 4-src op; backward not implemented in V1.
+
+struct ggml_tensor * ggml_fused_ffn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * down) {
+    GGML_ASSERT(ggml_is_contiguous(gate));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(up));
+    GGML_ASSERT(ggml_is_contiguous(down));
+    GGML_ASSERT(gate->type == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(up->type   == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(down->type == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    const int64_t hidden     = gate->ne[0];
+    const int64_t ffn_hidden = gate->ne[1];
+    const int64_t n_tokens   = x->ne[1];
+    GGML_ASSERT(hidden     % 32 == 0);
+    GGML_ASSERT(ffn_hidden % 32 == 0);
+    GGML_ASSERT(gate->ne[0] == hidden);
+    GGML_ASSERT(up->ne[0]   == hidden);
+    GGML_ASSERT(gate->ne[1] == up->ne[1]);
+    GGML_ASSERT(down->ne[0] == ffn_hidden);
+    GGML_ASSERT(down->ne[1] == hidden);
+    GGML_ASSERT(x->ne[0]    == hidden);
+    GGML_ASSERT(x->ne[3]    == 1);
+
+    const int64_t ne[4] = { hidden, n_tokens, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_FUSED_FFN;
+    result->src[0] = gate;
+    result->src[1] = x;
+    result->src[2] = up;
+    result->src[3] = down;
+    return result;
+}
+
 // ggml_norm
 
 static struct ggml_tensor * ggml_norm_impl(
@@ -6660,11 +6701,11 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_FUSED_FFN: {
-            // V1 (spec 041-tq4-fused-ffn): op registered but not yet emitted by
-            // llama-graph.cpp (wired in T7). Forward compute lives in
-            // ggml-cpu/ggml-cpu.c + ggml-vulkan; backward not implemented in V1.
-            // V2 must replace this with a real grad impl — silent no-op would
-            // lose gradients on src0..src3 without any error.
+            // spec 041 T7 V1: no backward; fail loud if grad requested.
+            // NOTE: ggml_compute_backward only tracks src0..src2 needs_grads;
+            // down=src3 is not in the grad infra, but V1 is inference-only
+            // (this case is unreachable unless tensor->grad is set).
+            GGML_ASSERT(!src0_needs_grads && !src1_needs_grads && !src2_needs_grads);
         } break;
         case GGML_OP_MUL_MAT: {
             // https://cs231n.github.io/optimization-2/#staged

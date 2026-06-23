@@ -2108,6 +2108,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_FUSED_FFN:
+            {
+                ggml_compute_forward_fused_ffn(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2291,6 +2295,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TURBO_WHT:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_FUSED_FFN:
+            {
+                // spec 041 T7: subgraph computed inline (see ops.cpp); single task avoids nested threadpool.
+                n_tasks = 1;
             } break;
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:

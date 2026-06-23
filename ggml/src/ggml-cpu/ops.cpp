@@ -2,6 +2,8 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11503,4 +11505,53 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
                 GGML_ABORT("fatal error - fwht is F32 only");
             }
     }
+}
+
+// spec 041 T7: CPU fallback for fused FFN. Decomposes the 4-src op into a
+// 5-node subgraph (gate_mm, silu, up_mm, mul, down_mm) and computes it on the
+// CPU backend. Correctness reference for the Vulkan fused kernel; not perf-
+// critical (production runs on Vulkan). Intermediates are gallocr-allocated in
+// a fresh 2 MB context; leaf weights (gate/x/up/down) reuse the parent buffer.
+void ggml_compute_forward_fused_ffn(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    // src[0..3] are read-only inputs, but the ggml builders take non-const handles.
+    struct ggml_tensor * gate = dst->src[0];
+    struct ggml_tensor * x    = dst->src[1];
+    struct ggml_tensor * up   = dst->src[2];
+    struct ggml_tensor * down = dst->src[3];
+
+    GGML_ASSERT(gate && x && up && down);
+    GGML_ASSERT(gate->type == GGML_TYPE_TQ4_1S && up->type == GGML_TYPE_TQ4_1S && down->type == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+
+    // Generous 2 MB ctx: covers work_data (~512 KB for 2560x12288 matvec) + tensor overhead.
+    const size_t ctx_mem = 2 * 1024 * 1024;
+    struct ggml_init_params iparams = { ctx_mem, NULL, /*no_alloc*/ true };
+    struct ggml_context * sub_ctx = ggml_init(iparams);
+    GGML_ASSERT(sub_ctx && "fused_ffn: failed to init subgraph context");
+
+    // 4-op decomposition (5 nodes incl. output).
+    struct ggml_tensor * t1  = ggml_mul_mat(sub_ctx, gate, x); // [ffn_hidden, n_tokens]
+    struct ggml_tensor * t2  = ggml_silu(sub_ctx, t1);          // [ffn_hidden, n_tokens]
+    struct ggml_tensor * t3  = ggml_mul_mat(sub_ctx, up, x);    // [ffn_hidden, n_tokens]
+    struct ggml_tensor * t4  = ggml_mul(sub_ctx, t2, t3);        // [ffn_hidden, n_tokens]
+    struct ggml_tensor * out = ggml_mul_mat(sub_ctx, down, t4); // [hidden, n_tokens]
+    ggml_set_output(out);
+
+    struct ggml_cgraph * sub_gf = ggml_new_graph(sub_ctx);
+    ggml_build_forward_expand(sub_gf, out);
+
+    // gallocr allocates intermediate tensors; leaves reuse the parent buffer.
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (!ggml_gallocr_alloc_graph(allocr, sub_gf)) {
+        ggml_gallocr_free(allocr);
+        ggml_free(sub_ctx);
+        GGML_ABORT("fused_ffn: gallocr_alloc_graph failed");
+    }
+
+    ggml_graph_compute_with_ctx(sub_ctx, sub_gf, params->nth);
+
+    memcpy(dst->data, out->data, ggml_nbytes(out));
+
+    ggml_gallocr_free(allocr);
+    ggml_free(sub_ctx);
 }
