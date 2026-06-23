@@ -41,7 +41,7 @@
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 // Mirrors C++ struct vk_fused_ffn_push_constants (ggml-vulkan.cpp).
-// Field count + order + type MUST match. 9 * 4 = 36 bytes.
+// Field count + order + type MUST match. 10 * 4 = 40 bytes.
 layout (push_constant) uniform parameter {
     uint ncols;       // ffn_hidden / 32 (= gate/up output dim in matvec-K units)
     uint ne0_h;       // hidden dim (= down matvec output rows = num_groups * 32)
@@ -52,6 +52,7 @@ layout (push_constant) uniform parameter {
     uint stride_out;
     uint nbpr_gate;   // == hidden / 32  (precomputed; saves host a divide)
     uint nbpr_down;   // == ne0_h / 32    (precomputed)
+    uint pass;        // 0 = pass 1-3 (gate/up matvec + silu*up -> scratch); 1 = pass 4 (down@scratch -> out)
 } p;
 
 //   binding 0: gate  weights  (block_tq4_1s, [hidden, ffn_hidden])
@@ -128,25 +129,30 @@ void main() {
     const uint n   = gl_WorkGroupID.x;          // output row in [0, num_groups)
     const uint tid = gl_LocalInvocationID.x;    // 0..31
 
-    // Pass 1+2: gate@x and up@x for row n. Both produce scalars; subgroupAdd
-    // leaves all 32 lanes holding the same row-scalar.
-    const float acc_gate = matvec_gate_row(n, p.nbpr_gate);
-    const float acc_up   = matvec_up_row(n, p.nbpr_gate);
+    // Two-dispatch flow (T7 fix): pass 1-3 and pass 4 are launched in
+    // separate ggml_vk_dispatch_pipeline() calls with ggml_vk_sync_buffers()
+    // between them for device-wide memory ordering. The workgroup-local
+    // barrier() that V0 used between pass-3 and pass-4 is gone — it never
+    // synchronized across workgroups anyway, and the sync_buffers() between
+    // dispatches is the correct mechanism for the pass-1 -> pass-4 dependency.
+    if (p.pass == 0u) {
+        // Pass 1+2: gate@x and up@x for row n. Both produce scalars; subgroupAdd
+        // leaves all 32 lanes holding the same row-scalar.
+        const float acc_gate = matvec_gate_row(n, p.nbpr_gate);
+        const float acc_up   = matvec_up_row(n, p.nbpr_gate);
 
-    // Pass 3: silu(gate)*up. Lane 0 writes scratch[n] (one scalar per row of
-    // gate/up output, indexed by ffn_hidden row n).
-    if (tid == 0u) {
-        const float g = acc_gate;
-        const float u = acc_up;
-        const float silu_g = g / (1.0f + exp(-g));
-        scratch[n] = silu_g * u;
-    }
-
-    // Memory barrier: scratch written by one lane, read by all lanes in pass 4.
-    barrier();
-
-    // Pass 4: down@scratch for row n. Each WG = one output row.
-    if (tid == 0u) {
-        data_out[n] = matvec_down_row(n, p.nbpr_down);
+        // Pass 3: silu(gate)*up. Lane 0 writes scratch[n] (one scalar per row
+        // of gate/up output, indexed by ffn_hidden row n).
+        if (tid == 0u) {
+            const float g = acc_gate;
+            const float u = acc_up;
+            const float silu_g = g / (1.0f + exp(-g));
+            scratch[n] = silu_g * u;
+        }
+    } else {
+        // Pass 4: down@scratch for row n. Each WG = one output row.
+        if (tid == 0u) {
+            data_out[n] = matvec_down_row(n, p.nbpr_down);
+        }
     }
 }

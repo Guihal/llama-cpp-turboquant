@@ -1155,9 +1155,12 @@ struct vk_op_glu_push_constants {
 
 // T8 (spec 041-tq4-fused-ffn): push constants for the fused-FFN sub-layer
 // dispatch. Mirrors the GLSL `parameter` block in fused_ffn.comp — field
-// count + order + type MUST match byte-for-byte. 9 * uint32 = 36 bytes.
+// count + order + type MUST match byte-for-byte. 10 * uint32 = 40 bytes.
 // V1: residual is folded outside this dispatch (no per-layer weight buffer
 // API in ggml), so the saved dispatch is the down matvec, not down+add.
+// pass: 0 = pass 1-3 (gate@x, up@x, silu(gate)*up -> scratch),
+//       1 = pass 4 (down@scratch -> out). Two-dispatch flow (T7 fix) with
+//       ggml_vk_sync_buffers() between them for cross-WG memory ordering.
 struct vk_fused_ffn_push_constants {
     uint32_t ncols;        // ffn_hidden / 32 (scratch / down output K-blocks)
     uint32_t ne0_h;        // hidden dim (down matvec output rows = WG count * 32)
@@ -1168,11 +1171,12 @@ struct vk_fused_ffn_push_constants {
     uint32_t stride_out;
     uint32_t nbpr_gate;    // hidden / 32 (gate/up matvec K-blocks; precomputed)
     uint32_t nbpr_down;    // == ncols (down matvec K-blocks; precomputed)
+    uint32_t pass;         // 0 = pass 1-3, 1 = pass 4
 };
 
 static_assert(sizeof(vk_fused_ffn_push_constants) <= 128,
               "vk_fused_ffn_push_constants exceeds Vulkan min pushConstantRange");
-static_assert(sizeof(vk_fused_ffn_push_constants) == 36,
+static_assert(sizeof(vk_fused_ffn_push_constants) == 40,
               "vk_fused_ffn_push_constants size drifted from GLSL parameter block");
 
 struct vk_op_unary_push_constants {
@@ -4551,8 +4555,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
             fused_ffn_f32_f32_subgroup_data,
             "main",
             /*parameter_count*/ 6,                                       // gate, x, up, down, scratch, out
-            sizeof(vk_fused_ffn_push_constants),                         // 36 bytes (T8-defined struct)
-            /*wg_denoms*/         {32, 1, 1},                            // matches shader local_size_x=32
+            sizeof(vk_fused_ffn_push_constants),                         // 40 bytes (T8-defined struct)
+            /*wg_denoms*/         {1, 1, 1},                             // 1 WG per output row (shader keeps V0 subgroupAdd semantics; local_size_x=32 from shader layout)
             /*spec_consts*/       {},
             /*align*/             1,
             /*disable_robustness*/ false,
@@ -10968,15 +10972,16 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         pc, { H, n_seqs, S_v });
 }
 
-// T5 (spec 041-tq4-fused-ffn): dispatch the fused-FFN sub-layer.
-// V1 contract (T1 + T8): src0=gate, src1=x, src2=up, src3=down. NO residual
-// (T1 explicit). V1 emits 1 dispatch (down matvec fused with the
-// swiglu_split+mul already fused upstream) — saves ~1 dispatch/layer vs the
-// 2-dispatch V0 (down + add). The shader's pass-4 output write is shapped
-// to `ncols` (=ffn_hidden/32) entries while the user contract expects
-// `hidden` entries; this is a shader-side issue deferred to T7 follow-up.
-// T5 only wires dispatch; the op is NOT YET emitted by build_ffn, so this
-// function will not be called until T7 lands.
+// T5 (spec 041-tq4-fused-ffn): two-dispatch fused-FFN. Pass 1 launches WGs
+// over gate/up rows (ncols = ffn_hidden/32) and writes silu(gate@x)*(up@x)
+// into scratch. Pass 2 launches WGs over down output rows (ncols = hidden/32)
+// and writes down@scratch into data_out. ggml_vk_sync_buffers() between the
+// dispatches enforces device-wide memory ordering for the scratch dep.
+// elements[0] is the row count BEFORE wg_denoms[0] divide (ggml_vk_dispatch_pipeline
+// does CEIL_DIV(elements[0], wg_denoms[0])); wg_denoms[0]=1 for this pipeline,
+// so one workgroup per output row (pass 1: gate/up row -> scratch; pass 2:
+// down output row -> data_out). The shader's local_size_x=32 is baked into
+// the SPV (subgroupAdd semantics, unchanged from V0).
 static void ggml_vk_fused_ffn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     // Capability gate: pipeline is null when unsupported.
     if (!ctx->device->fused_ffn_supported) {
@@ -11000,7 +11005,6 @@ static void ggml_vk_fused_ffn(ggml_backend_vk_context * ctx, vk_context& subctx,
     GGML_ASSERT((hidden     & 31u) == 0);
     GGML_ASSERT((ffn_hidden & 31u) == 0);
 
-    const uint32_t ncols     = ffn_hidden / 32u;
     const uint32_t ne0_h     = hidden;
     const uint32_t nbpr_gate = hidden     / 32u;
     const uint32_t nbpr_down = ffn_hidden / 32u;
@@ -11014,7 +11018,8 @@ static void ggml_vk_fused_ffn(ggml_backend_vk_context * ctx, vk_context& subctx,
     vk_pipeline pipeline = ctx->device->pipeline_fused_ffn;
     GGML_ASSERT(pipeline != nullptr);
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    // Two dispatches consume two descriptor sets.
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
 
     vk_subbuffer gate_buf = ggml_vk_tensor_subbuffer(ctx, src_gate);
     vk_subbuffer x_buf    = ggml_vk_tensor_subbuffer(ctx, src_x);
@@ -11032,19 +11037,37 @@ static void ggml_vk_fused_ffn(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
     vk_subbuffer scratch_buf = ggml_vk_subbuffer(ctx, ctx->fused_ffn_scratch, 0);
 
-    const vk_fused_ffn_push_constants pc = {
-        ncols, ne0_h,
+    const vk_fused_ffn_push_constants pc_pass1 = {
+        nbpr_down, ne0_h,
         stride_gate, stride_x, stride_up, stride_down, stride_out,
         nbpr_gate, nbpr_down,
+        0u,  // pass 1-3
     };
 
-    // Dispatch elements = {ncols, 1, 1} — one WG per gate/up/down row.
-    // TODO(T7): shader writes data_out[n] for n in [0, ncols); dst user
-    // contract expects hidden entries. Fix in T7 follow-up when the op is
-    // real and we can validate the output shape.
+    const vk_fused_ffn_push_constants pc_pass2 = {
+        nbpr_gate, ne0_h,
+        stride_gate, stride_x, stride_up, stride_down, stride_out,
+        nbpr_gate, nbpr_down,
+        1u,  // pass 4
+    };
+
+    // Pass 1-3: gate matvec + up matvec + silu(gate)*up -> scratch[0..ffn_hidden).
+    // elements[0] = ffn_hidden; ggml_vk_dispatch_pipeline divides by wg_denoms[0]=1
+    // -> ffn_hidden workgroups, one per gate/up output row (lane 0 writes scratch[n]).
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { gate_buf, x_buf, up_buf, down_buf, scratch_buf, out_buf },
-        pc, { ncols, 1u, 1u });
+        pc_pass1, { ffn_hidden, 1u, 1u });
+
+    // Device-wide memory barrier: scratch written by all pass-1 WGs must be
+    // visible to all pass-2 WGs before down@scratch reads.
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // Pass 4: down@scratch -> data_out[0..hidden).
+    // elements[0] = hidden; /1 -> hidden workgroups, one per down output row
+    // (lane 0 writes data_out[n]). data_out has `hidden` entries; n=0..hidden covers all.
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { gate_buf, x_buf, up_buf, down_buf, scratch_buf, out_buf },
+        pc_pass2, { hidden, 1u, 1u });
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
