@@ -7,6 +7,29 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+// TQ4_1S matvec dispatch (verified 2026-06-23 against ggml-vulkan.cpp:4351,4360):
+//   - tq4_1s_wg_size          = 32  → wave32 path: compute_outputs() below (NUM_COLS>1
+//                                    prefill) AND compute_outputs() in the MUL_MAT_ID
+//                                    pipeline.
+//   - tq4_1s_decode_wg_size   = 64  → wave64 path: compute_outputs_cacheline() defined
+//                                    in mul_mat_vec_tq4_1s.glslh (owned by another agent,
+//                                    out of scope here). Selected when NUM_COLS==1.
+//
+// PR #21751 coalesced 12-byte scale/d0/d1 read (the top finding in
+// docs/tq4-accel-research/specs/042-research-quant.md) lives in compute_outputs()
+// at lines ~95-99 below (wave32 / prefill / MUL_MAT_ID). Verified mathematically:
+// tid in [0,32) → (tid >> 4) is 0 for tid<16 and 1 for tid>=16, exactly the d0/d1
+// split, and the array-index form defeats mesa's unsigned-upper-bound ternary
+// coalescing failure.
+//
+// Wave64 decode (compute_outputs_cacheline in the glslh) currently uses the
+// un-coalesced (tid_in_half < 16u) ? d0 : d1 ternary antipattern. Deferred —
+// the glslh is another agent's territory.
+//
+// No additional .glslh header is needed: the existing mul_mat_vec_tq4_1s.glslh
+// supplies compute_outputs_cacheline, TQ4_CENTROIDS_SCALED, TQ4_SIGNS, and the
+// shared base.
+
 // See the commit message on a850ccc for the full derivation and portability
 // rationale.  Short version: pre-rotate the activation block via forward WHT
 // in shared memory, then dot-product against the raw centroid*scale weights.
@@ -96,6 +119,9 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             // 32-bit SSBO load). Then index via constant array. Eliminates the `?:` ternary
             // that mesa's unsigned-upper-bound analysis can't fold (forces 3 un-coalesced
             // loads). tid >> 4u == (tid < 16u ? 0 : 1) for tid in [0, 32).
+            //
+            // Verified for wave32 (the only WG size that runs this body per
+            // tq4_1s_wg_size=32 dispatch in ggml-vulkan.cpp:4351).
             const float d0 = float(data_a[ib].d0);
             const float d1 = float(data_a[ib].d1);
             const float ds[2] = float[2](d0, d1);

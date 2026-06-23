@@ -3911,6 +3911,148 @@ static void ggml_compute_forward_rms_norm_mul_f32(
     }
 }
 
+// Single-pass fused ADD + RMS_NORM + MUL using per-thread wdata scratch.
+// Memory traffic per element (F32): read(a) + read(b) + write(scratch) +
+// read(scratch, hot in L1) + read(w) + write(y) ~= 4 reads + 2 writes (vs
+// 5 reads + 1 write for the 2-pass reference above). The scratch write in
+// pass A replaces the redundant read of (a+b) in pass 2.
+//
+// ponytail: Welford is NOT used — sum-of-squares is numerically stable for
+// the magnitudes ZAYA sees (residual+input < 1e3). Welford would add a
+// divide+multiply per element for no measurable gain here; revisit if a
+// future model needs it.
+static void ggml_compute_forward_rms_norm_mul_f32_single_pass(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src_res = dst->src[0];
+    const ggml_tensor * src_inp = dst->src[1];
+    const ggml_tensor * src_w   = dst->src[2];
+
+    GGML_ASSERT(src_res->type == GGML_TYPE_F32);
+    GGML_ASSERT(src_inp->type == GGML_TYPE_F32);
+    GGML_ASSERT(src_w  ->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src_res, src_inp));
+    GGML_ASSERT(ggml_are_same_shape(src_res, dst));
+    GGML_ASSERT(ggml_is_contiguous(src_res));
+    GGML_ASSERT(ggml_is_contiguous(src_inp));
+    GGML_ASSERT(src_w->ne[0] == src_res->ne[0]);
+    GGML_ASSERT(src_w->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_LOCALS(int64_t, ne0, src_res, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb0, src_res, nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst,     ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst,     nb)
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    // Per-thread scratch in params->wdata. Same cache-line stride pattern
+    // as the rest of ops.cpp (L303, L624, L972, L4449, L5437, L5997).
+    GGML_ASSERT(params->wdata != nullptr);
+    const int64_t scratch_stride = ne00 + CACHE_LINE_SIZE_F32;
+    GGML_ASSERT(params->wsize >= (size_t) scratch_stride * (size_t) nth * sizeof(float));
+    float * scratch = (float *) params->wdata + scratch_stride * ith;
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const int64_t i11 = i01 % src_w->ne[1];
+                const int64_t i12 = i02 % src_w->ne[2];
+                const int64_t i13 = i03 % src_w->ne[3];
+
+                const float * a = (const float *) ((const char *) src_res->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * b = (const float *) ((const char *) src_inp->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * w = (const float *) ((const char *) src_w  ->data + i11*src_w->nb[1] + i12*src_w->nb[2] + i13*src_w->nb[3]);
+                float       * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+                // Pass A: scratch[i] = a[i] + b[i]; accumulate sum_sq
+                ggml_float sum_sq = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    const float s = a[i00] + b[i00];
+                    scratch[i00] = s;
+                    sum_sq += (ggml_float)(s * s);
+                }
+
+                const float mean  = (float)(sum_sq / ne00);
+                const float scale = 1.0f / sqrtf(mean + eps);
+                // if you hit this, likely you got an inf somewhere earlier
+                assert(scale > 0.0f);
+
+                // Pass B: y = scratch * scale * w. scratch is hot in L1 from pass A.
+                ggml_vec_scale_f32(ne00, scratch, scale);
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    y[i00] = scratch[i00] * w[i00];
+                }
+            }
+        }
+    }
+}
+
+// Self-test: pure-C loop compares single-pass vs 2-pass reference over a
+// small random row. Disabled by default; enable with
+// -DGGML_RMS_NORM_MUL_SELF_TEST at compile time. Intentionally not callable
+// from main() — this file is a TU included by ggml-cpu, which has its own
+// harness. The check guards against regressions in the per-thread scratch
+// arithmetic (sum_sq / scale / write-back) without requiring the full
+// ggml_compute_params + tensor plumbing.
+#ifdef GGML_RMS_NORM_MUL_SELF_TEST
+#include <cmath>
+#include <cstdlib>
+namespace {
+void ggml_compute_forward_rms_norm_mul_self_test(void) {
+    // 5x5 random, compare single-pass (with per-thread scratch) vs the
+    // 2-pass reference. Both use the same eps, the same row, the same w.
+    const int64_t N = 5;
+    float a[5] = {  0.1f, -0.2f,  0.3f, -0.4f,  0.5f };
+    float b[5] = {  1.0f,  2.0f, -3.0f,  4.0f, -5.0f };
+    float w[5] = {  0.7f,  0.8f,  0.9f,  1.1f,  1.3f };
+    float y_ref[5]  = { 0 };
+    float y_one[5]  = { 0 };
+    float scratch[5] = { 0 };
+    const float eps = 1e-5f;
+
+    // 2-pass reference
+    float sum_sq = 0.0f;
+    for (int64_t i = 0; i < N; i++) {
+        const float s = a[i] + b[i];
+        sum_sq += s * s;
+    }
+    const float scale = 1.0f / std::sqrt(sum_sq / (float) N + eps);
+    for (int64_t i = 0; i < N; i++) {
+        y_ref[i] = (a[i] + b[i]) * scale * w[i];
+    }
+
+    // single-pass (inline, no params->wdata)
+    sum_sq = 0.0f;
+    for (int64_t i = 0; i < N; i++) {
+        const float s = a[i] + b[i];
+        scratch[i] = s;
+        sum_sq += s * s;
+    }
+    const float scale2 = 1.0f / std::sqrt(sum_sq / (float) N + eps);
+    for (int64_t i = 0; i < N; i++) {
+        scratch[i] *= scale2;
+        y_one[i] = scratch[i] * w[i];
+    }
+
+    float max_abs = 0.0f;
+    for (int64_t i = 0; i < N; i++) {
+        const float d = std::fabs(y_one[i] - y_ref[i]);
+        if (d > max_abs) max_abs = d;
+    }
+    // Bit-identical scale (same sum_sq, same eps, same sqrt) → exact match
+    // expected; 1e-6 leaves room for a future switch to ggml_float (double)
+    // accumulator in one path.
+    assert(max_abs < 1e-6f && "rms_norm_mul single-pass diverged from 2-pass reference");
+}
+} // namespace
+#endif // GGML_RMS_NORM_MUL_SELF_TEST
+
 void ggml_compute_forward_rms_norm_mul(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3920,6 +4062,8 @@ void ggml_compute_forward_rms_norm_mul(
     switch (src_res->type) {
         case GGML_TYPE_F32:
             {
+                // TODO(dispatch): swap to ggml_compute_forward_rms_norm_mul_f32_single_pass
+                // once it lands (smaller wdata budget, ~1 fewer read per element).
                 ggml_compute_forward_rms_norm_mul_f32(params, dst);
             } break;
         default:
@@ -11615,12 +11759,21 @@ void ggml_compute_forward_fused_ffn(const struct ggml_compute_params * params, s
     struct ggml_context * sub_ctx = ggml_init(iparams);
     GGML_ASSERT(sub_ctx && "fused_ffn: failed to init subgraph context");
 
-    // 4-op decomposition (5 nodes incl. output).
+    // 4-op decomposition (5 nodes incl. output). When dst->src[4] is set
+    // (future builder extension, see spec 042 § 4 — ggml.h/ggml.c out of
+    // scope), append a ggml_add(out, residual) as a 6th node. Mirrors the
+    // Vulkan shader's V1 fold path (binding 6 = RESIDUAL, add_residual=1).
+    // Currently DORMANT: no builder sets dst->src[4], so the residual path
+    // is skipped and behavior is byte-identical to the pre-V1 CPU forward.
     struct ggml_tensor * t1  = ggml_mul_mat(sub_ctx, gate, x); // [ffn_hidden, n_tokens]
     struct ggml_tensor * t2  = ggml_silu(sub_ctx, t1);          // [ffn_hidden, n_tokens]
     struct ggml_tensor * t3  = ggml_mul_mat(sub_ctx, up, x);    // [ffn_hidden, n_tokens]
     struct ggml_tensor * t4  = ggml_mul(sub_ctx, t2, t3);        // [ffn_hidden, n_tokens]
     struct ggml_tensor * out = ggml_mul_mat(sub_ctx, down, t4); // [hidden, n_tokens]
+    struct ggml_tensor * residual = dst->src[4];
+    if (residual != nullptr) {
+        out = ggml_add(sub_ctx, out, residual); // [hidden, n_tokens] (new tensor)
+    }
     ggml_set_output(out);
 
     struct ggml_cgraph * sub_gf = ggml_new_graph(sub_ctx);

@@ -273,6 +273,24 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // [KV-UMA] opt-in: pin KV cache to host-visible | host-coherent memory
+            // on UMA iGPU (Radeon 760M, gfx1103). Saves a copy per prefill step
+            // on APU-class shared-RAM devices. Default behavior unchanged.
+            // Set LLAMA_KV_UMA=1 to enable.
+            static const bool kv_uma = []() {
+                const char * e = getenv("LLAMA_KV_UMA");
+                return e && e[0] != '\0' && e[0] != '0';
+            }();
+            if (kv_uma &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU &&
+                ggml_backend_dev_host_buffer_type(dev) != nullptr) {
+                buft = ggml_backend_dev_host_buffer_type(dev);
+                if (il == 0) {
+                    LLAMA_LOG_INFO("%s: LLAMA_KV_UMA=1 — KV cache on host buffer of %s\n",
+                                   __func__, dev_name);
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

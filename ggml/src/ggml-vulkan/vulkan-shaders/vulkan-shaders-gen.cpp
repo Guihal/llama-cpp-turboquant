@@ -784,6 +784,9 @@ void process_shaders() {
 
     // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
     string_to_spv("turbo_wht", "turbo_wht.comp", {});
+    // Single-wave coalesced WHT (local_size_x=32, subgroupShuffleXor). PR #23687-style
+    // barrier-free intra-wave butterfly; only meaningful when device subgroup_size >= 32.
+    string_to_spv("turbo_wht_coalesced", "turbo_wht.coalesced.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

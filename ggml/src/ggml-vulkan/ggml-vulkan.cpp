@@ -853,6 +853,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv_transpose_1d_f32;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_turbo_wht;
+    vk_pipeline pipeline_turbo_wht_coalesced;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
@@ -1155,9 +1156,15 @@ struct vk_op_glu_push_constants {
 
 // T8 (spec 041-tq4-fused-ffn): push constants for the fused-FFN sub-layer
 // dispatch. Mirrors the GLSL `parameter` block in fused_ffn.comp — field
-// count + order + type MUST match byte-for-byte. 10 * uint32 = 40 bytes.
-// V1: residual is folded outside this dispatch (no per-layer weight buffer
-// API in ggml), so the saved dispatch is the down matvec, not down+add.
+// count + order + type MUST match byte-for-byte. 11 * uint32 = 44 bytes.
+// V1 (spec 042-A2): 11th field `add_residual` is the residual-fold gate.
+//   0 = out = acc_down; 1 = out = acc_down + residual[n] (binding 6).
+// Currently host always sets 0 (shader-side binding 6 = RESIDUAL is not yet
+// landed in fused_ffn.comp — see ggml_vk_fused_ffn dispatch for activation
+// preconditions). When the shader's binding 6 + 11th push const land and
+// L4552 bumps `pipeline_fused_ffn` parameter_count 6 → 7, the dispatch will
+// (a) compute residual_buf from dst->src[4], (b) append it to the
+// descriptor_buffer_infos, (c) populate pc_pass2.add_residual = 1u.
 // pass: 0 = pass 1-3 (gate@x, up@x, silu(gate)*up -> scratch),
 //       1 = pass 4 (down@scratch -> out). Two-dispatch flow (T7 fix) with
 //       ggml_vk_sync_buffers() between them for cross-WG memory ordering.
@@ -1172,11 +1179,12 @@ struct vk_fused_ffn_push_constants {
     uint32_t nbpr_gate;    // hidden / 32 (gate/up matvec K-blocks; precomputed)
     uint32_t nbpr_down;    // == ncols (down matvec K-blocks; precomputed)
     uint32_t pass;         // 0 = pass 1-3, 1 = pass 4
+    uint32_t add_residual; // 0 = no fold (out = acc_down); 1 = out = acc_down + residual[n]
 };
 
 static_assert(sizeof(vk_fused_ffn_push_constants) <= 128,
               "vk_fused_ffn_push_constants exceeds Vulkan min pushConstantRange");
-static_assert(sizeof(vk_fused_ffn_push_constants) == 40,
+static_assert(sizeof(vk_fused_ffn_push_constants) == 44,
               "vk_fused_ffn_push_constants size drifted from GLSL parameter block");
 
 struct vk_op_unary_push_constants {
@@ -4554,8 +4562,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
             fused_ffn_f32_f32_subgroup_len,
             fused_ffn_f32_f32_subgroup_data,
             "main",
-            /*parameter_count*/ 6,                                       // gate, x, up, down, scratch, out
-            sizeof(vk_fused_ffn_push_constants),                         // 40 bytes (T8-defined struct)
+            /*parameter_count*/ 6,                                       // gate, x, up, down, scratch, out (V1: bump to 7 to add RESIDUAL binding 6; see spec 042 § 2)
+            sizeof(vk_fused_ffn_push_constants),                         // 44 bytes (T8+V1: 11 * uint32 — add_residual appended; see struct doc-comment for activation preconditions)
             /*wg_denoms*/         {1, 1, 1},                             // 1 WG per output row (shader keeps V0 subgroupAdd semantics; local_size_x=32 from shader layout)
             /*spec_consts*/       {},
             /*align*/             1,
@@ -4969,6 +4977,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     // TurboQuant WHT (forward / inverse rotation, 128-element block)
     ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 2, 3 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+
+    // Single-wave coalesced WHT (local_size_x=32, subgroupShuffleXor). Only build on
+    // devices with wave32 subgroup ops; else dispatch falls back to the 128-element pipeline.
+    if (device->subgroup_size_control && device->subgroup_size >= 32) {
+        ggml_vk_create_pipeline(device, device->pipeline_turbo_wht_coalesced, "turbo_wht_coalesced", turbo_wht_coalesced_len, turbo_wht_coalesced_data, "main", 3, 4 * sizeof(uint32_t), {32, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -11039,18 +11053,37 @@ static void ggml_vk_fused_ffn(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
     vk_subbuffer scratch_buf = ggml_vk_subbuffer(ctx, ctx->fused_ffn_scratch, 0);
 
+    // ponytail: brace-init has 11 positional args; 11th = add_residual.
+    // Pass 1 writes SCRATCH (never OUT), so add_residual is unused here —
+    // value 0 keeps the struct match the GLSL push block (currently 40
+    // bytes in SPV; V1 will be 44). When (a)+(b)+(c) below land, change
+    // pc_pass2's 11th value to `(dst->src[4] != nullptr) ? 1u : 0u` and
+    // append the residual subbuffer to the pass-2 descriptor_buffer_infos.
     const vk_fused_ffn_push_constants pc_pass1 = {
         nbpr_down, ne0_h,
         stride_gate, stride_x, stride_up, stride_down, stride_out,
         nbpr_gate, nbpr_down,
-        0u,  // pass 1-3
+        0u,  // pass 1-3 (gate/up matvec + silu*up -> scratch)
+        0u   // add_residual (unused on pass 1)
     };
 
+    // add_residual activation requires ALL THREE of:
+    //   (a) fused_ffn.comp declares binding 6 = RESIDUAL + p.add_residual
+    //       (currently shader is 40 bytes / 6 bindings — shader-side land
+    //       is OUT OF SCOPE for this packet; see spec 042 § "HARD BLOCKER")
+    //   (b) L4552 bumps `pipeline_fused_ffn` parameter_count 6 → 7
+    //       (owned by another parallel agent on ggml-vulkan.cpp)
+    //   (c) A builder sets dst->src[4] to the residual tensor
+    //       (ggml.h/ggml.c out of scope; spec 042 § 4)
+    // Until (a)+(b)+(c) land: add_residual=0 (11th push const field is
+    // value-init to 0 — SPIR-V either ignores it [40-byte shader today] or
+    // folds the `add_residual ? data_residual[n] : 0` select to no-op [V1]).
     const vk_fused_ffn_push_constants pc_pass2 = {
         nbpr_gate, ne0_h,
         stride_gate, stride_x, stride_up, stride_down, stride_out,
         nbpr_gate, nbpr_down,
-        1u,  // pass 4
+        1u,  // pass 4 (down@scratch -> out)
+        0u   // add_residual (activation deferred — see comment above)
     };
 
     // Pass 1-3: gate matvec + up matvec + silu(gate)*up -> scratch[0..ffn_hidden).
@@ -11060,9 +11093,29 @@ static void ggml_vk_fused_ffn(ggml_backend_vk_context * ctx, vk_context& subctx,
         { gate_buf, x_buf, up_buf, down_buf, scratch_buf, out_buf },
         pc_pass1, { ffn_hidden, 1u, 1u });
 
-    // Device-wide memory barrier: scratch written by all pass-1 WGs must be
-    // visible to all pass-2 WGs before down@scratch reads.
-    ggml_vk_sync_buffers(ctx, subctx);
+    // Device-side buffer barrier (replaces host-side ggml_vk_sync_buffers()):
+    // pass-1 WGs wrote scratch (WRITE), pass-2 WGs read scratch (READ).
+    // Scoped to scratch_buf only — no host round-trip, no other buffers touched.
+    // ponytail: vulkan-hpp BufferMemoryBarrier is constructed positionally
+    // (sType is a static const, NOT a member; pNext is the LAST ctor param).
+    // Ranged via scratch_buf.size (= ggml_vk_get_max_buffer_range), not the
+    // raw scratch_bytes, so any alignment/rounding is honored.
+    const vk::BufferMemoryBarrier scratch_barrier(
+        vk::AccessFlagBits::eShaderWrite,                  // srcAccessMask
+        vk::AccessFlagBits::eShaderRead,                   // dstAccessMask
+        VK_QUEUE_FAMILY_IGNORED,                           // srcQueueFamilyIndex
+        VK_QUEUE_FAMILY_IGNORED,                           // dstQueueFamilyIndex
+        scratch_buf.buffer->buffer,                        // buffer
+        0,                                                 // offset
+        scratch_buf.size,                                  // size
+        nullptr);                                          // pNext
+    subctx->s->buffer->buf.pipelineBarrier(
+        subctx->p->q->stage_flags,                         // srcStageMask
+        subctx->p->q->stage_flags,                         // dstStageMask
+        {},                                                // dependencyFlags
+        {},                                                // memoryBarriers
+        { scratch_barrier },                               // bufferMemoryBarriers
+        {});                                               // imageMemoryBarriers
 
     // Pass 4: down@scratch -> data_out[0..hidden).
     // elements[0] = hidden; /1 -> hidden workgroups, one per down output row
@@ -11424,27 +11477,51 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
     int direction, group_size;
     memcpy(&direction, dst->op_params + 0, sizeof(int));
     memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
-    struct { uint32_t ne; uint32_t direction; uint32_t group_size; } pc = {
-        (uint32_t)ggml_nelements(src0), (uint32_t)direction, (uint32_t)group_size,
-    };
-    vk_pipeline pipeline = ctx->device->pipeline_turbo_wht;
-    GGML_ASSERT(pipeline != nullptr);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0, false);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, false);
-    // Spread workgroups across Y/Z to stay within maxComputeWorkGroupCount[0].
-    const uint32_t n_groups = pc.ne / (uint32_t)group_size;
+    const uint32_t ne = (uint32_t)ggml_nelements(src0);
+    const uint32_t n_groups = ne / (uint32_t)group_size;
     std::array<uint32_t, 3> elements;
-    if (n_groups > 262144) {
-        elements = { 512 * (uint32_t)group_size, 512, CEIL_DIV(n_groups, 262144) };
-    } else if (n_groups > 512) {
-        elements = { 512 * (uint32_t)group_size, CEIL_DIV(n_groups, 512), 1 };
-    } else {
-        elements = { pc.ne, 1, 1 };
-    }
-    // Compute-to-compute RAW/WAW ordering must be explicit on Vulkan.
+    vk_pipeline pipeline;
     ggml_vk_sync_buffers(ctx, subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, elements);
+
+    if (group_size == 32 && ctx->device->pipeline_turbo_wht_coalesced != nullptr) {
+        // Single-wave coalesced WHT (local_size_x=32, subgroupShuffleXor).
+        // Elements layout mirrors the existing 128-element shader: 1 group per WG,
+        // X covers 512 groups (wg0=512), Y <= 512 (each Y unit covers 512 groups),
+        // Z caps at maxComputeWorkGroupCount[2].
+        struct { uint32_t ne; uint32_t direction; uint32_t group_size; uint32_t scale_present; } pc = {
+            ne, (uint32_t)direction, (uint32_t)group_size, 0u,
+        };
+        pipeline = ctx->device->pipeline_turbo_wht_coalesced;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        if (n_groups > 262144) {
+            elements = { 512u * 32u, 512, CEIL_DIV(n_groups, 262144) };
+        } else if (n_groups > 512) {
+            elements = { 512u * 32u, CEIL_DIV(n_groups, 512), 1 };
+        } else {
+            elements = { ne, 1, 1 };
+        }
+        // binding 2 (scale_inv) unused when scale_present==0; pass src_buf as a valid descriptor
+        // because the shader's set layout requires 3 bindings.
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, src_buf }, pc, elements);
+    } else {
+        struct { uint32_t ne; uint32_t direction; uint32_t group_size; } pc = {
+            ne, (uint32_t)direction, (uint32_t)group_size,
+        };
+        pipeline = ctx->device->pipeline_turbo_wht;
+        GGML_ASSERT(pipeline != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        // Spread workgroups across Y/Z to stay within maxComputeWorkGroupCount[0].
+        if (n_groups > 262144) {
+            elements = { 512 * (uint32_t)group_size, 512, CEIL_DIV(n_groups, 262144) };
+        } else if (n_groups > 512) {
+            elements = { 512 * (uint32_t)group_size, CEIL_DIV(n_groups, 512), 1 };
+        } else {
+            elements = { ne, 1, 1 };
+        }
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, elements);
+    }
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
