@@ -648,6 +648,9 @@ struct vk_device_struct {
     uint32_t subgroup_max_size;
     bool subgroup_require_full_support;
 
+    // TQ4 spec 041: capability flag for fused FFN path (subgroup_size_control + wave64).
+    bool fused_ffn_supported;
+
     // floor(log2(maxComputeWorkGroupInvocations))
     uint32_t max_workgroup_size_log2 {};
 
@@ -5524,6 +5527,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 subgroup_size_control_features.subgroupSizeControl;
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
+
+        // TQ4 spec 041: fused FFN path requires subgroup_size_control ext (refined) + wave64.
+        device->fused_ffn_supported = device->subgroup_size_control
+                                     && device->subgroup_size >= 64;
 
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;

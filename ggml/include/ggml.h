@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_FUSED_FFN, // Fused FFN sub-layer: gate,up,down matvecs + silu. V1: src0=gate,src1=x,src2=up,src3=down,dst=silu(gate@x)*(up@x)@down; no residual folding.
+
         GGML_OP_COUNT,
     };
 

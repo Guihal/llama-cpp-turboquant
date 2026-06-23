@@ -1,0 +1,120 @@
+#ifndef MUL_MAT_VEC_TQ4_1S_GLSLH
+#define MUL_MAT_VEC_TQ4_1S_GLSLH
+
+// T6 (spec 041): extract the Path F (9091928) cacheline-coalesced
+// TQ4_1S matvec body into a reusable header. The original body lived in
+// mul_mat_vec_tq4_1s.comp (~70 lines, gated on !MUL_MAT_ID).
+
+#include "mul_mat_vec_base.glsl"
+
+// Lloyd-Max centroids for TQ4_1S (4-bit, 16 levels) — N(0, 1) optimal
+// Pre-multiplied by 1/√32 to save 1 multiply per dequant.
+// ponytail: flat float[16] is better than vec4[4] pack — the 2-level index
+// (idx>>2, idx&3) increases VGPR pressure from 42 to 63.
+const float TQ4_CENTROIDS_SCALED[16] = float[16](
+    -0.48305823, -0.36575399, -0.28603282, -0.22207236,
+    -0.16658375, -0.11609969, -0.06859784, -0.02269724,
+     0.02269724,  0.06859784,  0.11609969,  0.16658375,
+     0.22207236,  0.28603282,  0.36575399,  0.48305823
+);
+
+// WHT sign pattern for 32-element blocks (shared by TQ3 and TQ4)
+const float TQ4_SIGNS[32] = float[32](
+    +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+    -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+    -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+    -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0
+);
+
+#if !defined(MUL_MAT_ID)
+// ponytail: Path F (cache-line coalesced matvec, decode only). 64 threads (full wave64)
+// read 32 bytes qs per super-iter covering 2 TQ4 blocks. 2x line utilization vs the 16-byte
+// sub-line read in the original body. Lanes 0..31 process block A, lanes 32..63 process
+// block B — two independent 32-element WHTs (subgroupShuffleXor step=16 stays within
+// halves for subgroup=64). sign_tid uses tid&31 to wrap TQ4_SIGNS[32] for lanes 32..63.
+// Only compiled when MUL_MAT_ID is not defined (ID path keeps the original body).
+void compute_outputs_cacheline(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint nbpr         = p.ncols / 32u;
+    const uint half_blk         = tid / 32u;            // 0 or 1
+    const uint tid_in_half  = tid & 31u;            // 0..31
+    const uint byte_idx     = tid / 2u;            // 0..31, &15u caps to block's 16-byte qs
+    const uint nibble_shift = (tid & 1u) * 4u;
+    const float sign_tid    = TQ4_SIGNS[tid & 31u]; // wrap: both halves share the 32-element sign
+    const uint w_base       = a_offset + first_row * nbpr;
+
+    const uint nbpr_aligned_2 = nbpr & ~1u;
+
+    for (uint blk = 0u; blk < nbpr_aligned_2; blk += 2u) {
+        const uint b_blk = blk + half_blk;  // blk or blk+1
+        const uint b_base = b_offset + b_blk * 32u;
+
+        // Activation: one fp32 element per lane from this block's activation buffer.
+        float act = float(data_b[b_base + tid_in_half]) * sign_tid;
+
+        // WHT butterfly (per-block, 32 elements). subgroup=64: step=16 stays within halves.
+        [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+            const float partner_val = subgroupShuffleXor(act, step);
+            act = ((tid_in_half & step) == 0u) ? (act + partner_val) : (partner_val - act);
+        }
+        barrier();
+
+        // Dequant + dot. byte_idx & 15u caps lane-32..63's byte index to the block's 16-byte qs.
+        const uint w_blk = blk + half_blk;
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uint ib = w_base + n * nbpr + w_blk;
+                const float d0 = float(data_a[ib].d0);
+                const float d1 = float(data_a[ib].d1);
+                const float d  = (tid_in_half < 16u) ? d0 : d1;
+                const uint qbyte = uint(data_a[ib].qs[byte_idx & 15u]);
+                const uint idx   = (qbyte >> nibble_shift) & 0xFu;
+                const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                temp[0u][n] += FLOAT_TYPE(w * act);
+            }
+        }
+    }
+
+    // Tail: one leftover block if nbpr is odd. Lanes 0..31 process it; lanes 32..63 skip.
+    if ((nbpr & 1u) != 0u) {
+        if (tid < 32u) {
+            const uint blk = nbpr - 1u;
+            const uint b_base = b_offset + blk * 32u;
+            float act = float(data_b[b_base + tid]) * sign_tid; // tid<32, sign_tid = TQ4_SIGNS[tid]
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                const float partner_val = subgroupShuffleXor(act, step);
+                act = ((tid & step) == 0u) ? (act + partner_val) : (partner_val - act);
+            }
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint ib = w_base + n * nbpr + blk;
+                    const float d0 = float(data_a[ib].d0);
+                    const float d1 = float(data_a[ib].d1);
+                    const float d  = (tid < 16u) ? d0 : d1;
+                    const uint qbyte = uint(data_a[ib].qs[tid / 2u]);
+                    const uint idx   = (qbyte >> ((tid & 1u) * 4u)) & 0xFu;
+                    const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                    temp[0u][n] += FLOAT_TYPE(w * act);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // reduce_result with BLOCK_SIZE=64 (spec const 0) + USE_SUBGROUP_ADD_NO_SHMEM (from
+    // tq4_1s_decode_reduc=SUBGROUP) uses pure subgroupAdd over 64 lanes; tmpsh unused.
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+#endif // !MUL_MAT_ID
+
+#endif // MUL_MAT_VEC_TQ4_1S_GLSLH

@@ -1129,7 +1129,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1238,9 +1238,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "fused_ffn(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6656,6 +6658,13 @@ static void ggml_compute_backward(
                 memcpy(&eps, tensor->op_params, sizeof(float));
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
             }
+        } break;
+        case GGML_OP_FUSED_FFN: {
+            // V1 (spec 041-tq4-fused-ffn): op registered but not yet emitted by
+            // llama-graph.cpp (wired in T7). Forward compute lives in
+            // ggml-cpu/ggml-cpu.c + ggml-vulkan; backward not implemented in V1.
+            // V2 must replace this with a real grad impl — silent no-op would
+            // lose gradients on src0..src3 without any error.
         } break;
         case GGML_OP_MUL_MAT: {
             // https://cs231n.github.io/optimization-2/#staged
