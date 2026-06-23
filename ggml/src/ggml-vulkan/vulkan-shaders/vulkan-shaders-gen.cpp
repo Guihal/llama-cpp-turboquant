@@ -723,6 +723,21 @@ void process_shaders() {
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
     }
 
+    // T8 (spec 041-tq4-fused-ffn): fused FFN sub-layer dispatch.
+    // src0=gate, src1=x, src2=up, src3=down (all block_tq4_1s for V1; src1 is float),
+    // dst = silu(gate@x) * (up@x) then down@scratch. 5 SSBOs + scratch. Subgroup
+    // reduce via USE_SUBGROUP_ADD. Op is registered but not yet emitted by
+    // llama-graph.cpp (T7 future); T5 will bind the SPV when the dispatch lands.
+    // fp16=true -> suffix "_fp32" (cosmetic; matches mul_mat_vec_*_f32_f32_subgroup family).
+    string_to_spv("fused_ffn_f32_f32_subgroup", "fused_ffn.comp", merge_maps(base_dict, {
+        {"DATA_A_TQ4_1S", "1"},
+        {"B_TYPE",        "float"},
+        {"B_TYPEV2",      "vec2"},
+        {"B_TYPEV4",      "vec4"},
+        {"D_TYPE",        "float"},
+        {"USE_SUBGROUP_ADD", "1"},
+    }), /*fp16=*/true, /*coopmat=*/false, /*coopmat2=*/false, /*f16acc=*/false);
+
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

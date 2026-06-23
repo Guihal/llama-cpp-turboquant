@@ -1,0 +1,152 @@
+#version 450
+
+// T8 (spec 041-tq4-fused-ffn): Fused FFN sub-layer shader.
+//
+// V1 contract (T8 dispatch-only):
+//   src0 = gate   (block_tq4_1s, [ne00=hidden,     ne01=ffn_hidden])  // [K=hidden, N=ffn_hidden]
+//   src1 = x      (float,         [ne10=hidden,     ne11=1])
+//   src2 = up     (block_tq4_1s, [ne00=hidden,     ne01=ffn_hidden])
+//   src3 = down   (block_tq4_1s, [ne00=ffn_hidden, ne01=hidden])     // [K=ffn_hidden, N=hidden]
+//   dst  = out    (float,         [ne0=hidden])
+//
+// Math:
+//   scratch[k]   = silu(sum_j gate[k,j]*x[j]) * sum_j up[k,j]*x[j]   // [ffn_hidden]
+//   out[n]       = sum_k down[n,k] * scratch[k]                       // [hidden]
+//
+// Shapes follow GGML matmul convention: weights [K, N] so A row k is one
+// 32-element nibble block (K=32) and N columns produce N rows of output.
+// pass 1+2: WG n computes row n of gate/up output (scalar per K-block, reduced
+//           to ffn_hidden scalars and written to scratch).
+// pass 4:   WG n computes row n of down output (scalar over ffn_hidden K-blocks).
+//
+// V1 uses a SIMPLIFIED 32-thread matvec body (no cacheline coalescing, no
+// WHT pre-rotation — those belong to the dequant path in Path F
+// mul_mat_vec_tq4_1s.glslh, not to matvec against a plain float activation).
+// Fused-FFN's perf goal is "fewer dispatches", not "faster per-matvec".
+//
+// V1 op is registered (ggml.h: GGML_OP_FUSED_FFN) but NOT YET emitted by
+// llama-graph.cpp (T7 future). This shader is generated to SPV by
+// vulkan-shaders-gen.cpp and bound by T5. Until then: no dispatch.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Mirrors C++ struct vk_fused_ffn_push_constants (ggml-vulkan.cpp).
+// Field count + order + type MUST match. 9 * 4 = 36 bytes.
+layout (push_constant) uniform parameter {
+    uint ncols;       // ffn_hidden / 32 (= gate/up output dim in matvec-K units)
+    uint ne0_h;       // hidden dim (= down matvec output rows = num_groups * 32)
+    uint stride_gate;
+    uint stride_x;
+    uint stride_up;
+    uint stride_down;
+    uint stride_out;
+    uint nbpr_gate;   // == hidden / 32  (precomputed; saves host a divide)
+    uint nbpr_down;   // == ne0_h / 32    (precomputed)
+} p;
+
+//   binding 0: gate  weights  (block_tq4_1s, [hidden, ffn_hidden])
+//   binding 1: x     input    (float,         [hidden])
+//   binding 2: up    weights  (block_tq4_1s, [hidden, ffn_hidden])
+//   binding 3: down  weights  (block_tq4_1s, [ffn_hidden, hidden])
+//   binding 4: scratch intermediate (silu(gate)*up), float, ffn_hidden entries
+//   binding 5: out   output   (float,         [hidden])
+layout (binding = 0) readonly buffer GATE  { block_tq4_1s data_gate []; };
+layout (binding = 1) readonly buffer X     { float        data_x    []; };
+layout (binding = 2) readonly buffer UP    { block_tq4_1s data_up   []; };
+layout (binding = 3) readonly buffer DOWN  { block_tq4_1s data_down []; };
+layout (binding = 4)          buffer SCRATCH { float     scratch  []; };
+layout (binding = 5) writeonly buffer OUT  { float        data_out []; };
+
+// Lloyd-Max centroids for TQ4_1S, pre-multiplied by 1/sqrt(32).
+// Duplicated from mul_mat_vec_tq4_1s.glslh. Including that header would also
+// pull in mul_mat_vec_base.glsl (get_offsets/reduce_result) which is shaped
+// for the matvec family's binding layout (not this op's).
+const float TQ4_CENTROIDS_SCALED[16] = float[16](
+    -0.48305823, -0.36575399, -0.28603282, -0.22207236,
+    -0.16658375, -0.11609969, -0.06859784, -0.02269724,
+     0.02269724,  0.06859784,  0.11609969,  0.16658375,
+     0.22207236,  0.28603282,  0.36575399,  0.48305823
+);
+
+// Dequant one TQ4_1S weight at lane tid from block w. Returns scalar weight.
+float dequant_lane(const block_tq4_1s w, const uint tid) {
+    const float d = (tid < 16u) ? float(w.d0) : float(w.d1);
+    const uint qbyte = uint(w.qs[tid / 2u]);
+    const uint nibble_shift = (tid & 1u) * 4u;
+    const uint idx = (qbyte >> nibble_shift) & 0xFu;
+    return TQ4_CENTROIDS_SCALED[idx] * d;
+}
+
+// gate@x matvec for row n: out_k = sum_j gate[n,j] * x[j].
+// We iterate K=hidden axis (block count = nbpr_gate = hidden/32). Each WG lane
+// reads x[lane], dequants gate[n*nbpr + blk] at the same lane, FMA. After the
+// loop, subgroupAdd reduces 32 partials into the scalar output row element.
+float matvec_gate_row(const uint n, const uint nbpr) {
+    float acc = 0.0f;
+    const uint base = n * nbpr;
+    for (uint blk = 0u; blk < nbpr; ++blk) {
+        const float b = data_x[blk * 32u + gl_LocalInvocationID.x];
+        acc += dequant_lane(data_gate[base + blk], gl_LocalInvocationID.x) * b;
+    }
+    return subgroupAdd(acc);
+}
+
+// up@x matvec for row n (identical shape to gate, different buffer).
+float matvec_up_row(const uint n, const uint nbpr) {
+    float acc = 0.0f;
+    const uint base = n * nbpr;
+    for (uint blk = 0u; blk < nbpr; ++blk) {
+        const float b = data_x[blk * 32u + gl_LocalInvocationID.x];
+        acc += dequant_lane(data_up[base + blk], gl_LocalInvocationID.x) * b;
+    }
+    return subgroupAdd(acc);
+}
+
+// down@scratch matvec for row n. K-axis = ffn_hidden/32 = nbpr_down. Each block
+// reads scratch[blk] (one scalar per K-block) broadcast to all lanes.
+float matvec_down_row(const uint n, const uint nbpr) {
+    float acc = 0.0f;
+    const uint base = n * nbpr;
+    for (uint blk = 0u; blk < nbpr; ++blk) {
+        const float b = scratch[blk];
+        acc += dequant_lane(data_down[base + blk], gl_LocalInvocationID.x) * b;
+    }
+    return subgroupAdd(acc);
+}
+
+void main() {
+    const uint n   = gl_WorkGroupID.x;          // output row in [0, num_groups)
+    const uint tid = gl_LocalInvocationID.x;    // 0..31
+
+    // Pass 1+2: gate@x and up@x for row n. Both produce scalars; subgroupAdd
+    // leaves all 32 lanes holding the same row-scalar.
+    const float acc_gate = matvec_gate_row(n, p.nbpr_gate);
+    const float acc_up   = matvec_up_row(n, p.nbpr_gate);
+
+    // Pass 3: silu(gate)*up. Lane 0 writes scratch[n] (one scalar per row of
+    // gate/up output, indexed by ffn_hidden row n).
+    if (tid == 0u) {
+        const float g = acc_gate;
+        const float u = acc_up;
+        const float silu_g = g / (1.0f + exp(-g));
+        scratch[n] = silu_g * u;
+    }
+
+    // Memory barrier: scratch written by one lane, read by all lanes in pass 4.
+    barrier();
+
+    // Pass 4: down@scratch for row n. Each WG = one output row.
+    if (tid == 0u) {
+        data_out[n] = matvec_down_row(n, p.nbpr_down);
+    }
+}

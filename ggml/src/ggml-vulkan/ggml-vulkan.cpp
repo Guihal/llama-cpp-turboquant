@@ -816,6 +816,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_reglu[2];
     vk_pipeline pipeline_swiglu[2];
     vk_pipeline pipeline_swiglu_oai[2];
+    // T4 (spec 041-tq4-fused-ffn): bind the fused-FFN shader (SPV produced by T8's vulkan-shaders-gen entry).
+    vk_pipeline pipeline_fused_ffn;
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
 
@@ -1150,6 +1152,28 @@ struct vk_op_glu_push_constants {
     uint32_t ne11;
     uint32_t ne12;
 };
+
+// T8 (spec 041-tq4-fused-ffn): push constants for the fused-FFN sub-layer
+// dispatch. Mirrors the GLSL `parameter` block in fused_ffn.comp — field
+// count + order + type MUST match byte-for-byte. 9 * uint32 = 36 bytes.
+// V1: residual is folded outside this dispatch (no per-layer weight buffer
+// API in ggml), so the saved dispatch is the down matvec, not down+add.
+struct vk_fused_ffn_push_constants {
+    uint32_t ncols;        // ffn_hidden / 32 (scratch / down output K-blocks)
+    uint32_t ne0_h;        // hidden dim (down matvec output rows = WG count * 32)
+    uint32_t stride_gate;
+    uint32_t stride_x;
+    uint32_t stride_up;
+    uint32_t stride_down;
+    uint32_t stride_out;
+    uint32_t nbpr_gate;    // hidden / 32 (gate/up matvec K-blocks; precomputed)
+    uint32_t nbpr_down;    // == ncols (down matvec K-blocks; precomputed)
+};
+
+static_assert(sizeof(vk_fused_ffn_push_constants) <= 128,
+              "vk_fused_ffn_push_constants exceeds Vulkan min pushConstantRange");
+static_assert(sizeof(vk_fused_ffn_push_constants) == 36,
+              "vk_fused_ffn_push_constants size drifted from GLSL parameter block");
 
 struct vk_op_unary_push_constants {
     uint32_t ne;
@@ -4512,6 +4536,26 @@ static void ggml_vk_load_shaders(vk_device& device) {
     GGML_UNUSED(rm_kq_int);
     GGML_UNUSED(rm_iq_int);
 #endif
+
+    // T4 (spec 041-tq4-fused-ffn): bind fused-FFN pipeline. 6 SSBOs (gate/x/up/down/scratch/out);
+    // 32-thread WG (matches fused_ffn.comp layout(local_size_x=32)); subgroupAdd reduction.
+    if (device->fused_ffn_supported) {
+        ggml_vk_create_pipeline(
+            device, device->pipeline_fused_ffn,
+            "fused_ffn_f32_f32_subgroup",
+            fused_ffn_f32_f32_subgroup_len,
+            fused_ffn_f32_f32_subgroup_data,
+            "main",
+            /*parameter_count*/ 6,                                       // gate, x, up, down, scratch, out
+            sizeof(vk_fused_ffn_push_constants),                         // 36 bytes (T8-defined struct)
+            /*wg_denoms*/         {32, 1, 1},                            // matches shader local_size_x=32
+            /*spec_consts*/       {},
+            /*align*/             1,
+            /*disable_robustness*/ false,
+            /*require_full_subgroups*/     false,
+            /*required_subgroup_size*/     32                            // shader uses subgroupAdd
+        );
+    }
 
     // dequant shaders
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_F32 ], "f32_to_f16",   dequant_f32_len,  dequant_f32_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
