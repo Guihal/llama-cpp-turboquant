@@ -91,9 +91,15 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         float w_vals[NUM_ROWS];
         for (uint n = 0; n < num_rows; ++n) {
             const uint ib   = w_base + n * num_blocks_per_row + blk;
+            // ponytail: PR #21751 coalesce — read both fp16 scales unconditionally
+            // (adjacent fields, 4-byte aligned in the 20-byte block → mesa coalesces to one
+            // 32-bit SSBO load). Then index via constant array. Eliminates the `?:` ternary
+            // that mesa's unsigned-upper-bound analysis can't fold (forces 3 un-coalesced
+            // loads). tid >> 4u == (tid < 16u ? 0 : 1) for tid in [0, 32).
             const float d0 = float(data_a[ib].d0);
             const float d1 = float(data_a[ib].d1);
-            const float d  = (tid < 16u) ? d0 : d1;
+            const float ds[2] = float[2](d0, d1);
+            const float d  = ds[tid >> 4u];
             const uint qbyte = uint(data_a[ib].qs[byte_idx]);
             const uint idx   = (qbyte >> nibble_shift) & 0xFu;
             w_vals[n] = TQ4_CENTROIDS_SCALED[idx] * d;

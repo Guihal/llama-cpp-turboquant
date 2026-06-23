@@ -1,0 +1,81 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// turbo_wht.coalesced.comp
+//
+// Single-wave WHT for TQ4_1S group_size=32 path. Port of upstream
+// PR #23687 (jeffbolznv) barrier-free intra-wave butterfly.
+//
+// Compared to turbo_wht.comp:
+//   - 1 workgroup = 1 group (32 elements), local_size_x = 32 (single wave32)
+//   - 5 butterfly stages via subgroupShuffleXor, NO barrier() between stages
+//   - Pre-fused S1 sign array into load (saves 1 barrier + 1 mul pass)
+//   - 3 bindings: A (src), D (dst), SC (InnerQ scale_inv, may be NULL-gated by scale_present)
+//
+// Production ZAYA path uses group_size=128 (auto at ggml.c:6399), so this
+// shader ships as architectural parity with the CUDA TQ_WEIGHT_SIGNS path
+// (ggml-cuda/turbo-wht.cu:60). Integration agent decides when to dispatch
+// this pipeline (gate: group_size == 32).
+
+layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint direction;
+    uint group_size;
+    uint scale_present;
+} p;
+
+layout (binding = 0) readonly  buffer A  { float data_a[]; };
+layout (binding = 1) writeonly buffer D  { float data_d[]; };
+layout (binding = 2) readonly  buffer SC { float data_s[]; };
+
+// WHT sign arrays (32-element subset of the 128-element arrays in turbo_wht.comp).
+// direction == 0: pre = S1, post = S2; direction == 1: pre = S2, post = S1.
+const float S1[32] = float[32](
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1
+);
+
+const float S2[32] = float[32](
+     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1
+);
+
+const float INV_SQRT_32 = 0.17677669529663688;  // 1 / sqrt(32)
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint base = (gl_WorkGroupID.z * 262144u + gl_WorkGroupID.y * 512u + gl_WorkGroupID.x) * 32u;
+
+    if (base + tid >= p.ne) return;
+
+    const float fs = (p.direction == 0u) ? S1[tid] : S2[tid];
+    const float ss = (p.direction == 0u) ? S2[tid] : S1[tid];
+
+    // InnerQ forward: apply scale_inv BEFORE signs+WHT (for Q pre-rotation).
+    // (Mirror of CUDA path at ggml-cuda/turbo-wht.cu:49-51.)
+    float v = data_a[base + tid];
+    if (p.direction == 0u && p.scale_present != 0u) {
+        v *= data_s[tid % 32u];
+    }
+    v *= fs;
+
+    // 5-stage butterfly via subgroupShuffleXor — NO barrier between stages
+    // because all 32 threads are in 1 wave. PR #23687-style port.
+    [[unroll]] for (uint h = 1u; h < 32u; h *= 2u) {
+        float other = subgroupShuffleXor(v, h);
+        v = ((tid & h) == 0u) ? (v + other) : (v - other);
+    }
+
+    // Normalize + second sign array, write to output.
+    float result = v * INV_SQRT_32 * ss;
+    // InnerQ inverse: apply scale_inv AFTER WHT+signs (for V un-rotation).
+    if (p.direction == 1u && p.scale_present != 0u) {
+        result *= data_s[tid % 32u];
+    }
+
+    data_d[base + tid] = result;
+}

@@ -3843,6 +3843,92 @@ void ggml_compute_forward_rms_norm_mul_fused(
     }
 }
 
+// Fused ADD + RMS_NORM + MUL: out = w * rms_norm(a + b, eps).
+// src[0] = residual (a), src[1] = input (b), src[2] = weight (w).
+// Reference impl: 2 passes per row, no scratch buffer.
+// Memory: 4 reads (a,b each twice) + 1 write per element.
+// ponytail: this exists as a CPU correctness reference for the planned
+// Vulkan shader fusion (spec 042 D.1). single-pass Welford once parity proven.
+static void ggml_compute_forward_rms_norm_mul_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src_res = dst->src[0];
+    const ggml_tensor * src_inp = dst->src[1];
+    const ggml_tensor * src_w   = dst->src[2];
+
+    GGML_ASSERT(src_res->type == GGML_TYPE_F32);
+    GGML_ASSERT(src_inp->type == GGML_TYPE_F32);
+    GGML_ASSERT(src_w  ->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src_res, src_inp));
+    GGML_ASSERT(ggml_are_same_shape(src_res, dst));
+    GGML_ASSERT(ggml_is_contiguous(src_res));
+    GGML_ASSERT(ggml_is_contiguous(src_inp));
+    GGML_ASSERT(src_w->ne[0] == src_res->ne[0]);
+    GGML_ASSERT(src_w->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_LOCALS(int64_t, ne0, src_res, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb0, src_res, nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst,     ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst,     nb)
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const int64_t i11 = i01 % src_w->ne[1];
+                const int64_t i12 = i02 % src_w->ne[2];
+                const int64_t i13 = i03 % src_w->ne[3];
+
+                const float * a = (const float *) ((const char *) src_res->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * b = (const float *) ((const char *) src_inp->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * w = (const float *) ((const char *) src_w  ->data + i11*src_w->nb[1] + i12*src_w->nb[2] + i13*src_w->nb[3]);
+                float       * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+                // Pass 1: sum of squares of (a + b)
+                ggml_float sum = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    const float s = a[i00] + b[i00];
+                    sum += (ggml_float)(s * s);
+                }
+                const float mean  = (float)(sum / ne00);
+                const float scale = 1.0f / sqrtf(mean + eps);
+                // if you hit this, likely you got an inf somewhere earlier
+                assert(scale > 0.0f);
+
+                // Pass 2: out = (a + b) * scale * w
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    y[i00] = (a[i00] + b[i00]) * scale * w[i00];
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_rms_norm_mul(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src_res = dst->src[0];
+
+    switch (src_res->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rms_norm_mul_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_rms_norm_back_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
