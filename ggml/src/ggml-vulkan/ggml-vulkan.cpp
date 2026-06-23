@@ -1934,6 +1934,10 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // T5 (spec 041-tq4-fused-ffn): lazy scratch buffer for fused-FFN dispatch
+    // (binding 4 of fused_ffn_f32_f32_subgroup). Cached on the context, grown
+    // when the ffn_hidden exceeds the current allocation.
+    vk_buffer fused_ffn_scratch;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -10964,6 +10968,85 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         pc, { H, n_seqs, S_v });
 }
 
+// T5 (spec 041-tq4-fused-ffn): dispatch the fused-FFN sub-layer.
+// V1 contract (T1 + T8): src0=gate, src1=x, src2=up, src3=down. NO residual
+// (T1 explicit). V1 emits 1 dispatch (down matvec fused with the
+// swiglu_split+mul already fused upstream) — saves ~1 dispatch/layer vs the
+// 2-dispatch V0 (down + add). The shader's pass-4 output write is shapped
+// to `ncols` (=ffn_hidden/32) entries while the user contract expects
+// `hidden` entries; this is a shader-side issue deferred to T7 follow-up.
+// T5 only wires dispatch; the op is NOT YET emitted by build_ffn, so this
+// function will not be called until T7 lands.
+static void ggml_vk_fused_ffn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    // Capability gate: pipeline is null when unsupported.
+    if (!ctx->device->fused_ffn_supported) {
+        return;
+    }
+
+    const ggml_tensor * src_gate = dst->src[0];
+    const ggml_tensor * src_x    = dst->src[1];
+    const ggml_tensor * src_up   = dst->src[2];
+    const ggml_tensor * src_down = dst->src[3];
+
+    GGML_ASSERT(src_gate->type == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(src_up->type   == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(src_down->type == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(src_x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t hidden     = (uint32_t)(src_gate->ne[0]);
+    const uint32_t ffn_hidden = (uint32_t)(src_gate->ne[1]);
+    GGML_ASSERT((hidden     & 31u) == 0);
+    GGML_ASSERT((ffn_hidden & 31u) == 0);
+
+    const uint32_t ncols     = ffn_hidden / 32u;
+    const uint32_t ne0_h     = hidden;
+    const uint32_t nbpr_gate = hidden     / 32u;
+    const uint32_t nbpr_down = ffn_hidden / 32u;
+
+    const uint32_t stride_gate = (uint32_t)(src_gate->nb[1] / ggml_type_size(src_gate->type));
+    const uint32_t stride_up   = (uint32_t)(src_up->nb[1]   / ggml_type_size(src_up->type));
+    const uint32_t stride_down = (uint32_t)(src_down->nb[1] / ggml_type_size(src_down->type));
+    const uint32_t stride_x    = (uint32_t)(src_x->nb[1]    / ggml_type_size(src_x->type));
+    const uint32_t stride_out  = (uint32_t)(dst->nb[1]      / ggml_type_size(dst->type));
+
+    vk_pipeline pipeline = ctx->device->pipeline_fused_ffn;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer gate_buf = ggml_vk_tensor_subbuffer(ctx, src_gate);
+    vk_subbuffer x_buf    = ggml_vk_tensor_subbuffer(ctx, src_x);
+    vk_subbuffer up_buf   = ggml_vk_tensor_subbuffer(ctx, src_up);
+    vk_subbuffer down_buf = ggml_vk_tensor_subbuffer(ctx, src_down);
+    vk_subbuffer out_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    // ponytail: scratch is lazily allocated on the context. Realloc on size
+    // change (rare; ffn_hidden is model-fixed). Real implementation lands when
+    // T7 emits this op and we can validate sizes from the graph.
+    const size_t scratch_bytes = (size_t)ffn_hidden * sizeof(float);
+    if (ctx->fused_ffn_scratch == nullptr || ctx->fused_ffn_scratch->size < scratch_bytes) {
+        ggml_vk_destroy_buffer(ctx->fused_ffn_scratch);
+        ctx->fused_ffn_scratch = ggml_vk_create_buffer_device(ctx->device, scratch_bytes);
+    }
+    vk_subbuffer scratch_buf = ggml_vk_subbuffer(ctx, ctx->fused_ffn_scratch, 0);
+
+    const vk_fused_ffn_push_constants pc = {
+        ncols, ne0_h,
+        stride_gate, stride_x, stride_up, stride_down, stride_out,
+        nbpr_gate, nbpr_down,
+    };
+
+    // Dispatch elements = {ncols, 1, 1} — one WG per gate/up/down row.
+    // TODO(T7): shader writes data_out[n] for n in [0, ncols); dst user
+    // contract expects hidden entries. Fix in T7 follow-up when the op is
+    // real and we can validate the output shape.
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { gate_buf, x_buf, up_buf, down_buf, scratch_buf, out_buf },
+        pc, { ncols, 1u, 1u });
+}
+
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -13717,6 +13800,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_RWKV_WKV7:
         ggml_vk_rwkv_wkv7(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FUSED_FFN:
+        ggml_vk_fused_ffn(ctx, compute_ctx, node);
 
         break;
 
