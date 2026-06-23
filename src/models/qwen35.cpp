@@ -15,6 +15,24 @@ static bool qwen35_fuse_qkv_enabled() {
     return enabled;
 }
 
+// Forward declaration for G.2 Q/K/V fusion helper (defined further below).
+// Defined at file scope as a free function to avoid duplicating the fused/fallback
+// branch across graph + graph_mtp. Takes the owning llm_graph_context so it can
+// call build_lora_mm (a method of llm_graph_context).
+static void build_attn_qkv_fused(
+        llm_graph_context *   gctx,
+        ggml_context *        ctx0,
+        const llama_layer &   layer,
+        ggml_tensor *         cur,
+        int                   il,
+        int64_t               n_tokens,
+        int64_t               n_embd_head,
+        int64_t               n_head,
+        int64_t               n_head_kv,
+        ggml_tensor *&        Qcur_full,
+        ggml_tensor *&        Kcur,
+        ggml_tensor *&        Vcur);
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -281,7 +299,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     ggml_tensor * Qcur_full;
     ggml_tensor * Kcur;
     ggml_tensor * Vcur;
-    build_attn_qkv_fused(ctx0, model.layers[il], cur, il,
+    build_attn_qkv_fused(this, ctx0, model.layers[il], cur, il,
                          n_tokens, n_embd_head, n_head, n_head_kv,
                          Qcur_full, Kcur, Vcur);
     cb(Qcur_full, "Qcur_full", il);
@@ -575,7 +593,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * Qcur_full;
     ggml_tensor * Kcur;
     ggml_tensor * Vcur;
-    build_attn_qkv_fused(ctx0, layer, cur, il,
+    build_attn_qkv_fused(this, ctx0, layer, cur, il,
                          n_tokens, n_embd_head, n_head, n_head_kv,
                          Qcur_full, Kcur, Vcur);
     cb(Qcur_full, "mtp_Qcur_full", il);
@@ -671,20 +689,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 // and views the slice with QKV-row stride as nb[2]. In fallback mode emits three
 // contiguous mul_mats and reuses their row strides. Spec: 042-audit-G-H.md G.2.
 static void build_attn_qkv_fused(
-        ggml_context *      ctx0,
-        const llama_layer & layer,
-        ggml_tensor *       cur,
-        int                 il,
-        int64_t             n_tokens,
-        int64_t             n_embd_head,
-        int64_t             n_head,
-        int64_t             n_head_kv,
-        ggml_tensor *&      Qcur_full,
-        ggml_tensor *&      Kcur,
-        ggml_tensor *&      Vcur) {
+        llm_graph_context *   gctx,
+        ggml_context *        ctx0,
+        const llama_layer &   layer,
+        ggml_tensor *         cur,
+        int                   il_,
+        int64_t               n_tokens,
+        int64_t               n_embd_head,
+        int64_t               n_head,
+        int64_t               n_head_kv,
+        ggml_tensor *&        Qcur_full,
+        ggml_tensor *&        Kcur,
+        ggml_tensor *&        Vcur) {
     const int64_t q_total = n_embd_head * 2 * n_head;
     const int64_t k_total = n_embd_head * n_head_kv;
-    const int64_t v_total = n_embd_head * n_head_kv;
 
     if (qwen35_fuse_qkv_enabled()) {
         // ponytail: BitNet per-tensor scales must be absent; Qwen3.5 GGUF does not populate them.
@@ -695,7 +713,7 @@ static void build_attn_qkv_fused(
         ggml_tensor * wqkv_tmp = ggml_concat(ctx0, layer.wq, layer.wk, 1);
         ggml_tensor * wqkv     = ggml_concat(ctx0, wqkv_tmp, layer.wv, 1);
 
-        ggml_tensor * QKV_full = build_lora_mm(wqkv, cur, /*scale=*/nullptr);
+        ggml_tensor * QKV_full = gctx->build_lora_mm(wqkv, cur, /*scale=*/nullptr);
         // QKV_full: [q_total + k_total + v_total, n_tokens], contiguous (mul_mat output)
 
         const size_t es     = ggml_element_size(QKV_full);
@@ -716,11 +734,11 @@ static void build_attn_qkv_fused(
         Vcur = ggml_view_3d(ctx0, QKV_full, n_embd_head, n_head_kv, n_tokens,
                             es * n_embd_head, nb_qkv, off_v);
     } else {
-        Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+        Qcur_full = gctx->build_lora_mm(layer.wq, cur, layer.wq_s);
         // Qcur_full: [q_total, n_tokens], contiguous.
 
-        ggml_tensor * Kcur_2d = build_lora_mm(layer.wk, cur, layer.wk_s);
-        ggml_tensor * Vcur_2d = build_lora_mm(layer.wv, cur, layer.wv_s);
+        ggml_tensor * Kcur_2d = gctx->build_lora_mm(layer.wk, cur, layer.wk_s);
+        ggml_tensor * Vcur_2d = gctx->build_lora_mm(layer.wv, cur, layer.wv_s);
         // Each contiguous; nb[1] = k_total*es or v_total*es. nb[2] of the 3D view below
         // equals the row stride of the source.
 
