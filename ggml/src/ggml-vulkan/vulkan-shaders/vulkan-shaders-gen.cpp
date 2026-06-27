@@ -602,6 +602,57 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
 void process_shaders() {
     // matmul
+
+    // TQ4_1S fused coopmat mul_mm: uses a dedicated shader (mul_mm_tq4_1s.comp)
+    // because TQ4_1S requires WHT butterfly during A-tile load, which the generic
+    // mul_mm.comp cannot do. Generated here, outside the matmul_shaders loop,
+    // to avoid generating unwanted MUL_MAT_ID variants.
+    {
+        // f16 variants (fp16=true, FLOAT16=1, B_TYPE=float16_t) for coopmat/coopmat2 paths
+        const std::map<std::string, std::string> tq4_f16_base = {
+            {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPEV2", "f16vec2"}, {"FLOAT_TYPEV4", "f16vec4"},
+            {"FLOAT16", "1"}, {"FLOAT_TYPE_MAX", "float16_t(65504.0)"}
+        };
+        for (const bool& f16acc : {false, true}) {
+            // Non-coopmat2 coopmat path (VK_KHR_cooperative_matrix)
+            string_to_spv("matmul_tq4_1s_f16", "mul_mm_tq4_1s.comp",
+                merge_maps(tq4_f16_base,
+                    {{"DATA_A_TQ4_1S", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "2"}}),
+                true, true, false, f16acc);
+            string_to_spv("matmul_tq4_1s_f16_aligned", "mul_mm_tq4_1s.comp",
+                merge_maps(tq4_f16_base,
+                    {{"DATA_A_TQ4_1S", "1"}, {"B_TYPE", "f16vec4"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "4"}, {"ALIGNED", "1"}}),
+                true, true, false, f16acc);
+            // coopmat2 path (VK_NV_cooperative_matrix2)
+            string_to_spv("matmul_tq4_1s_f16", "mul_mm_tq4_1s.comp",
+                merge_maps(tq4_f16_base,
+                    {{"DATA_A_TQ4_1S", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "2"}}),
+                true, false, true, f16acc);
+            string_to_spv("matmul_tq4_1s_f16_aligned", "mul_mm_tq4_1s.comp",
+                merge_maps(tq4_f16_base,
+                    {{"DATA_A_TQ4_1S", "1"}, {"B_TYPE", "f16vec4"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "4"}, {"ALIGNED", "1"}}),
+                true, false, true, f16acc);
+        }
+        // f32 variants (fp16=false, B_TYPE=float) for non-coopmat2 fallback path
+        const std::map<std::string, std::string> tq4_f32_base = {
+            {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"}
+        };
+        string_to_spv("matmul_tq4_1s_f32", "mul_mm_tq4_1s.comp",
+            merge_maps(tq4_f32_base,
+                {{"DATA_A_TQ4_1S", "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"},
+                 {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "2"}}),
+            false, false, false, false);
+        string_to_spv("matmul_tq4_1s_f32_aligned", "mul_mm_tq4_1s.comp",
+            merge_maps(tq4_f32_base,
+                {{"DATA_A_TQ4_1S", "1"}, {"B_TYPE", "vec4"}, {"D_TYPE", "float"},
+                 {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "4"}, {"ALIGNED", "1"}}),
+            false, false, false, false);
+    }
+
     for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT, MatMulIdType::SUBGROUP}) {
         // No coopmats
         // fp32
@@ -726,16 +777,36 @@ void process_shaders() {
     // T8 (spec 041-tq4-fused-ffn): fused FFN sub-layer dispatch.
     // src0=gate, src1=x, src2=up, src3=down (all block_tq4_1s for V1; src1 is float),
     // dst = silu(gate@x) * (up@x) then down@scratch. 5 SSBOs + scratch. Subgroup
-    // reduce via USE_SUBGROUP_ADD. Op is registered but not yet emitted by
-    // llama-graph.cpp (T7 future); T5 will bind the SPV when the dispatch lands.
+    // reduce via USE_SUBGROUP_ADD.
     // fp16=true -> suffix "_fp32" (cosmetic; matches mul_mat_vec_*_f32_f32_subgroup family).
-    string_to_spv("fused_ffn_f32_f32_subgroup", "fused_ffn.comp", merge_maps(base_dict, {
+    string_to_spv("fused_ffn_gate_f32_f32_subgroup", "fused_ffn.comp", merge_maps(base_dict, {
         {"DATA_A_TQ4_1S", "1"},
         {"B_TYPE",        "float"},
         {"B_TYPEV2",      "vec2"},
         {"B_TYPEV4",      "vec4"},
         {"D_TYPE",        "float"},
         {"USE_SUBGROUP_ADD", "1"},
+        {"FUSED_FFN_PASS_GATE", "1"},
+    }), /*fp16=*/true, /*coopmat=*/false, /*coopmat2=*/false, /*f16acc=*/false);
+
+    string_to_spv("fused_ffn_up_glu_f32_f32_subgroup", "fused_ffn.comp", merge_maps(base_dict, {
+        {"DATA_A_TQ4_1S", "1"},
+        {"B_TYPE",        "float"},
+        {"B_TYPEV2",      "vec2"},
+        {"B_TYPEV4",      "vec4"},
+        {"D_TYPE",        "float"},
+        {"USE_SUBGROUP_ADD", "1"},
+        {"FUSED_FFN_PASS_UP_GLU", "1"},
+    }), /*fp16=*/true, /*coopmat=*/false, /*coopmat2=*/false, /*f16acc=*/false);
+
+    string_to_spv("fused_ffn_down_f32_f32_subgroup", "fused_ffn.comp", merge_maps(base_dict, {
+        {"DATA_A_TQ4_1S", "1"},
+        {"B_TYPE",        "float"},
+        {"B_TYPEV2",      "vec2"},
+        {"B_TYPEV4",      "vec4"},
+        {"D_TYPE",        "float"},
+        {"USE_SUBGROUP_ADD", "1"},
+        {"FUSED_FFN_PASS_DOWN", "1"},
     }), /*fp16=*/true, /*coopmat=*/false, /*coopmat2=*/false, /*f16acc=*/false);
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
@@ -784,9 +855,6 @@ void process_shaders() {
 
     // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
     string_to_spv("turbo_wht", "turbo_wht.comp", {});
-    // Single-wave coalesced WHT (local_size_x=32, subgroupShuffleXor). PR #23687-style
-    // barrier-free intra-wave butterfly; only meaningful when device subgroup_size >= 32.
-    string_to_spv("turbo_wht_coalesced", "turbo_wht.coalesced.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
