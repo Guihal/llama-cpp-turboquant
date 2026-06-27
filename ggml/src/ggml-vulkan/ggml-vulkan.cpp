@@ -6532,9 +6532,8 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         case GGML_TYPE_NVFP4:
             break;
         case GGML_TYPE_TQ4_1S:
-            // Fused shader compiles and passes F32-B tests, but crashes on F16 B
-            // (the actual model inference path). Disable until F16 B is debugged.
-            // The two-step fallback (dequant_tq4_1s + generic mul_mm) remains proven correct.
+            // Fused shader has B-layout bug (stride_b=256 vs coopmat stride=20).
+            // Revert to two-step fallback until B-loading is fixed.
             return nullptr;
         default:
             return nullptr;

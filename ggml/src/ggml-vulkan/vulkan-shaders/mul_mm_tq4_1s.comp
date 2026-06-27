@@ -90,6 +90,11 @@ layout (constant_id = 10) const uint WARP = 32;
 shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
 shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 
+// HW-V-baseline: WHT intermediate in LDS (replaces 32-VGPR float buf[32])
+// 32 threads per TQ4 block × BM rows, but only 8 rows processed per pass.
+// Allocate for worst case (all rows active): BM * BK floats = 128*32 = 4096 floats = 16 KB.
+shared float wht_scratch[BM * BK];
+
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
 #ifdef COOPMAT
@@ -237,33 +242,42 @@ void main() {
 
     for (uint block = start_k; block < end_k; block += BK) {
         // --- Load A-tile: TQ4_1S blocks → dequant → WHT → shared memory ---
-        // Threads 0-127: each thread dequantizes one TQ4 block (32 elements).
-        // Thread writes 16 FLOAT_TYPEV2 pairs to buf_a.
+        // HW-V-baseline: 256 threads, 32 per TQ4 block, 8 blocks per pass.
+        // All 32 threads dequantize to LDS scratch, then ONE thread per block runs
+        // the sequential WHT butterfly in-register (float buf[32]).
+        // The 32 WHT outputs are stored in buf_a using the STANDARD mul_mm layout:
+        //   buf_a[col * SHMEM_STRIDE + row] = pair(wht_out[row*32 + col*2], wht_out[row*32 + col*2+1])
+        // This matches how coopMatLoad with stride=SHMEM_STRIDE reads elements.
         {
             const uint lane = gl_LocalInvocationIndex;
-            if (lane < BM) {
-                const uint global_row = ir * BM + lane;
-                const uint k_block_idx = (block - start_k) / BK;  // which block in K
+            const uint tid  = lane % BK;  // 0..31 element index within TQ4 block
 
+            for (uint pass = lane / BK; pass < BM; pass += BLOCK_SIZE / BK) {
+                const uint row = pass;  // 0..127
+                const uint global_row = ir * BM + row;
+                const uint k_block_idx = (block - start_k) / BK;
+
+                // Stage 1: dequantize and write 32 elements to LDS scratch
+                float wht_val = 0.0;
                 if (global_row < p.M && block < end_k) {
-                    // Read TQ4 block from A matrix — access fields directly to avoid
-                    // float16_t struct copy (float16 can only live in buffer storage)
-                    const uint a_idx = pos_a + lane * p.stride_a + k_block_idx;
-
+                    const uint a_idx = pos_a + row * p.stride_a + k_block_idx;
                     const float d0 = float(data_a[a_idx].d0);
                     const float d1 = float(data_a[a_idx].d1);
+                    const uint byte_idx = tid / 2u;
+                    const uint nibble_shift = (tid & 1u) * 4u;
+                    const uint centroid_idx = (uint(data_a[a_idx].qs[byte_idx]) >> nibble_shift) & 0xFu;
+                    const float d = (tid < 16u) ? d0 : d1;
+                    wht_val = TQ4_CENTROIDS[centroid_idx] * d;
+                }
+                wht_scratch[row * BK + tid] = wht_val;
+                barrier();
 
-                    // Dequantize 32 elements: centroids[idx] * d0/d1
+                // Stage 2: one thread per block runs the sequential WHT butterfly.
+                if (tid == 0u) {
                     float buf[32];
                     for (uint j = 0u; j < 32u; j++) {
-                        const uint byte_idx = j / 2u;
-                        const uint nibble_shift = (j & 1u) * 4u;
-                        const uint centroid_idx = (uint(data_a[a_idx].qs[byte_idx]) >> nibble_shift) & 0xFu;
-                        const float d = (j < 16u) ? d0 : d1;
-                        buf[j] = TQ4_CENTROIDS[centroid_idx] * d;
+                        buf[j] = wht_scratch[row * BK + j];
                     }
-
-                    // 5-stage WHT butterfly (all in registers — each thread has full 32 elements)
                     for (uint step = 1u; step < 32u; step <<= 1u) {
                         for (uint i = 0u; i < 32u; i += step * 2u) {
                             for (uint j = i; j < i + step; j++) {
@@ -274,27 +288,31 @@ void main() {
                             }
                         }
                     }
-
-                    // Normalize (×INV_SQRT32 × signs) and write to shared memory as FLOAT_TYPEV2 pairs
-                    for (uint j = 0u; j < 16u; j++) {
-                        const uint e0 = j * 2u;
-                        const uint e1 = j * 2u + 1u;
-                        buf_a[lane * SHMEM_STRIDE + j] = FLOAT_TYPEV2(
-                            FLOAT_TYPE(buf[e0] * INV_SQRT32 * TQ4_SIGNS[e0]),
-                            FLOAT_TYPE(buf[e1] * INV_SQRT32 * TQ4_SIGNS[e1])
-                        );
-                    }
-                } else {
-                    // Out of bounds: write zeros
-                    for (uint j = 0u; j < BK / 2; j++) {
-                        buf_a[lane * SHMEM_STRIDE + j] = FLOAT_TYPEV2(FLOAT_TYPE(0.0));
+                    // Normalize and pair-pack into buf_a.
+                    // Each FLOAT_TYPEV2 slot holds 2 consecutive WHT outputs.
+                    // coopMatLoad with i/2 reads 16 consecutive slots = 32 fp16.
+                    if (global_row < p.M) {
+                        for (uint j = 0u; j < BK / 2; j++) {
+                            const uint e0 = j * 2u;
+                            const uint e1 = j * 2u + 1u;
+                            buf_a[row * SHMEM_STRIDE + j] = FLOAT_TYPEV2(
+                                FLOAT_TYPE(buf[e0] * INV_SQRT32 * TQ4_SIGNS[e0]),
+                                FLOAT_TYPE(buf[e1] * INV_SQRT32 * TQ4_SIGNS[e1])
+                            );
+                        }
+                    } else {
+                        for (uint j = 0u; j < BK / 2; j++) {
+                            buf_a[row * SHMEM_STRIDE + j] = FLOAT_TYPEV2(FLOAT_TYPE(0.0));
+                        }
                     }
                 }
             }
         }
 
         // --- Load B-tile: standard fp16/scalar loading ---
-        // Adapted from mul_mm.comp scalar path for BK=32
+        // Adapted from mul_mm.comp scalar path for BK=32.
+        // NOTE: stride_b in push constants is ne10 (=K), but mul_mm loads B
+        // elements with a hardcoded stride of 2 (two consecutive fp16 per slot).
         {
             const uint lane = gl_LocalInvocationIndex;
             const uint loadr = lane % (BK / 2);
@@ -304,7 +322,9 @@ void main() {
             for (uint l = 0u; l < BN; l += loadstride) {
                 const uint col = loadc + l;
                 if (col < BN) {
-                    const uint b_idx = pos_b + col * p.stride_b + (block - start_k) + loadr * 2;
+                    const uint b_idx = pos_b + col * p.stride_b + loadr * 2;
+                    // Store at standard mul_mm position (col * SHMEM_STRIDE + loadr)
+                    // so coopMatLoad with i/2 reads correct elements.
                     const uint buf_idx = col * SHMEM_STRIDE + loadr;
 
                     if (col < p.N && block + loadr * 2 + 1 < end_k) {
