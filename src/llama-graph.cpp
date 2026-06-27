@@ -1223,12 +1223,20 @@ ggml_tensor * llm_graph_context::build_ffn(
                  int   il) const {
     // spec 041 T7: emit the fused FFN op (Vulkan decode-path) when all
     // preconditions hold; fall through to the original decomposition otherwise.
+    // GATE-OFF (2026-06-27, root-cause fused-ffn-root-cause-2026-06-27.md):
+    // the bespoke fused_ffn.comp is ~2x slower per-byte than the production
+    // Path-F mul_mat_vec_tq4_1s it replaces (tg128 24.27 -> 13.5). The unfused
+    // decomposition below already dispatches the optimized Path-F matvec per
+    // projection, so it IS the lowered form (Option B). Keep the infra for a
+    // future rewrite that reuses the Path-F body; opt-in via env until proven.
     // MoE is excluded by the arch guard: LLM_ARCH_QWEN35 is dense; the MoE
     // variant is a separate arch (LLM_ARCH_QWEN35MOE) with its own graph, and
     // build_ffn has no `layer` handle here to check ffn_gate_inp directly.
+    // Recurrent Qwen3.5 layers still use the same dense FFN after DeltaNet, so
+    // they are eligible for this FFN-only fusion.
     if (arch == LLM_ARCH_QWEN35
+        && getenv("GGML_VK_FUSED_FFN") != nullptr
         && il >= 0
-        && !hparams.is_recr((uint32_t) il)            // full-attn layers only (skip gated-delta-net)
         && type_op   == LLM_FFN_SILU
         && type_gate == LLM_FFN_PAR
         && !up_b && !up_s && !gate_b && !gate_s && !down_b && !down_s && !act_scales
