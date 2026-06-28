@@ -8471,6 +8471,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // TQ4_1S: Gemma-4 E2B dimensions. The fused mul_mat_vec kernel has a
     // shared-memory WHT on the activation and dequantizes centroid*scale per
     // thread; bugs in the butterfly or reduction only surface at production sizes.
+    for (int k : { 32, 64, 128 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 16, 9, k, {1, 1}, {1, 1}));
+    }
     for (int k : { 1536, 2048, 2304, 3072, 4096 }) {
         for (int m : { 256, 1152, 1536, 2048, 5120, 6144 }) {
             for (int n : { 1, 2, 4, 8 }) {
@@ -8502,6 +8505,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int k : { 1536, 2048 }) {
         for (int m : { 256, 1536, 2048 }) {
             for (int n : { 16, 64, 256 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // TQ4_1S: production-shape fused mul_mm (B-side WHT). These (M,N) exceed the
+    // old shape-gate envelope and now run the fused pipeline directly (gate removed
+    // 2026-06-28 once the serial A-side WHT was moved to a parallel B-side shuffle
+    // WHT). Qwen3.5-2B FFN-like shapes; F32 activations select the KHR-coopmat f32
+    // path. Keep the matrix small to bound correctness-suite runtime.
+    for (int k : { 2048, 6144 }) {
+        for (int m : { 2048, 4096, 6144 }) {
+            for (int n : { 256, 2048 }) {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
             }
         }

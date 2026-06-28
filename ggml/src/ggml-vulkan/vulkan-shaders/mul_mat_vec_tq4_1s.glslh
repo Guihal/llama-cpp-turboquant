@@ -27,11 +27,24 @@ const float TQ4_SIGNS[32] = float[32](
 );
 
 #if !defined(MUL_MAT_ID)
-// ponytail: Path F (cache-line coalesced matvec, decode only). 64 threads (full wave64)
-// read 32 bytes qs per super-iter covering 2 TQ4 blocks. 2x line utilization vs the 16-byte
-// sub-line read in the original body. Lanes 0..31 process block A, lanes 32..63 process
-// block B — two independent 32-element WHTs (subgroupShuffleXor step=16 stays within
-// halves for subgroup=64). sign_tid uses tid&31 to wrap TQ4_SIGNS[32] for lanes 32..63.
+// ponytail: Packet 2 (Z5 fallback — loop-overhead amortization on top of Path F).
+// Path F = 64 threads (wave64), reads 32 bytes qs per super-iter covering 2 TQ4 blocks.
+// Packet 2 (Z5) = same Path F body inlined TWICE per outer iter → 4 blocks per outer iter.
+// This halves the outer-loop iteration count (nbpr/4 instead of nbpr/2), reducing loop-
+// overhead instructions. The BW transaction count is unchanged: still 2 transactions per
+// super-iter, 2 super-iters per outer iter = same total BW as Path F.
+//
+// Honest expectation: ~1-3 % per-call matvec gain (loop-overhead only), 0 % wall tg128
+// (matvec is not the wall per Finding 6 in 045-gfx1103-research.md). The TRUE 64-byte
+// cache-line matvec (1 transaction per 4 blocks) requires re-quantizing TQ4_1S to pack
+// qs contiguously — out of scope for this packet (would touch ggml-turbo-quant.c).
+//
+// Tail logic covers all nbpr % 4 cases:
+//   nbpr % 4 == 0 → no tail
+//   nbpr % 4 == 1 → 1 leftover block (existing Path F tail)
+//   nbpr % 4 == 2 → 2 leftover blocks (1 Path F super-iter)
+//   nbpr % 4 == 3 → both tails fire (2-block super-iter + 1-block tail)
+//
 // Only compiled when MUL_MAT_ID is not defined (ID path keeps the original body).
 void compute_outputs_cacheline(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
@@ -53,23 +66,82 @@ void compute_outputs_cacheline(const uint32_t first_row, const uint32_t num_rows
     const float sign_tid    = TQ4_SIGNS[tid & 31u]; // wrap: both halves share the 32-element sign
     const uint w_base       = a_offset + first_row * nbpr;
 
-    const uint nbpr_aligned_2 = nbpr & ~1u;
+    // Packet 2: round down to multiple of 4 instead of 2. Each outer iter processes
+    // 4 blocks via 2 inlined Path F sub-iters (A: blk+half_blk for blocks blk,blk+1;
+    // B: blk+2+half_blk for blocks blk+2, blk+3).
+    const uint nbpr_aligned_4 = nbpr & ~3u;
 
-    for (uint blk = 0u; blk < nbpr_aligned_2; blk += 2u) {
-        const uint b_blk = blk + half_blk;  // blk or blk+1
+    [[unroll]] for (uint blk_quad = 0u; blk_quad < nbpr_aligned_4; blk_quad += 4u) {
+
+        // --- Sub-iter A: blocks blk_quad (half 0) and blk_quad+1 (half 1) ---
+        {
+            const uint b_blk  = blk_quad + half_blk;  // blk_quad or blk_quad+1
+            const uint b_base = b_offset + b_blk * 32u;
+
+            float act = float(data_b[b_base + tid_in_half]) * sign_tid;
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                const float partner_val = subgroupShuffleXor(act, step);
+                act = ((tid_in_half & step) == 0u) ? (act + partner_val) : (partner_val - act);
+            }
+            barrier();
+
+            const uint w_blk = blk_quad + half_blk;
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint ib = w_base + n * nbpr + w_blk;
+                    const float d0 = float(data_a[ib].d0);
+                    const float d1 = float(data_a[ib].d1);
+                    const float d  = (tid_in_half < 16u) ? d0 : d1;
+                    const uint qbyte = uint(data_a[ib].qs[byte_idx & 15u]);
+                    const uint idx   = (qbyte >> nibble_shift) & 0xFu;
+                    const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                    temp[0u][n] += FLOAT_TYPE(w * act);
+                }
+            }
+        }
+
+        // --- Sub-iter B: blocks blk_quad+2 (half 0) and blk_quad+3 (half 1) ---
+        {
+            const uint b_blk  = blk_quad + 2u + half_blk;
+            const uint b_base = b_offset + b_blk * 32u;
+
+            float act = float(data_b[b_base + tid_in_half]) * sign_tid;
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                const float partner_val = subgroupShuffleXor(act, step);
+                act = ((tid_in_half & step) == 0u) ? (act + partner_val) : (partner_val - act);
+            }
+            barrier();
+
+            const uint w_blk = blk_quad + 2u + half_blk;
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint ib = w_base + n * nbpr + w_blk;
+                    const float d0 = float(data_a[ib].d0);
+                    const float d1 = float(data_a[ib].d1);
+                    const float d  = (tid_in_half < 16u) ? d0 : d1;
+                    const uint qbyte = uint(data_a[ib].qs[byte_idx & 15u]);
+                    const uint idx   = (qbyte >> nibble_shift) & 0xFu;
+                    const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                    temp[0u][n] += FLOAT_TYPE(w * act);
+                }
+            }
+        }
+    }
+
+    // Tail A: 2 leftover blocks if nbpr & 2 != 0. 1 Path F super-iter (lanes 0..31 = block,
+    // lanes 32..63 = block+1). Covers nbpr % 4 == 2 and == 3.
+    if ((nbpr & 2u) != 0u) {
+        const uint blk = nbpr - 2u;
+        const uint b_blk  = blk + half_blk;
         const uint b_base = b_offset + b_blk * 32u;
 
-        // Activation: one fp32 element per lane from this block's activation buffer.
         float act = float(data_b[b_base + tid_in_half]) * sign_tid;
-
-        // WHT butterfly (per-block, 32 elements). subgroup=64: step=16 stays within halves.
         [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
             const float partner_val = subgroupShuffleXor(act, step);
             act = ((tid_in_half & step) == 0u) ? (act + partner_val) : (partner_val - act);
         }
         barrier();
 
-        // Dequant + dot. byte_idx & 15u caps lane-32..63's byte index to the block's 16-byte qs.
         const uint w_blk = blk + half_blk;
         [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
             if (n < num_rows) {
@@ -85,7 +157,8 @@ void compute_outputs_cacheline(const uint32_t first_row, const uint32_t num_rows
         }
     }
 
-    // Tail: one leftover block if nbpr is odd. Lanes 0..31 process it; lanes 32..63 skip.
+    // Tail B: 1 leftover block if nbpr & 1 != 0. Lanes 0..31 process it; lanes 32..63 skip.
+    // Covers nbpr % 4 == 1 and == 3.
     if ((nbpr & 1u) != 0u) {
         if (tid < 32u) {
             const uint blk = nbpr - 1u;

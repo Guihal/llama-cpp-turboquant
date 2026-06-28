@@ -3,32 +3,28 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_KHR_shader_subgroup_shuffle : enable
 
-#include "mul_mat_vec_tq4_1s.glslh"
+#include "mul_mat_vec_base.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-// TQ4_1S matvec dispatch (verified 2026-06-23 against ggml-vulkan.cpp:4351,4360):
-//   - tq4_1s_wg_size          = 32  → wave32 path: compute_outputs() below (NUM_COLS>1
-//                                    prefill) AND compute_outputs() in the MUL_MAT_ID
-//                                    pipeline.
-//   - tq4_1s_decode_wg_size   = 64  → wave64 path: compute_outputs_cacheline() defined
-//                                    in mul_mat_vec_tq4_1s.glslh (owned by another agent,
-//                                    out of scope here). Selected when NUM_COLS==1.
-//
-// PR #21751 coalesced 12-byte scale/d0/d1 read (the top finding in
-// docs/tq4-accel-research/specs/042-research-quant.md) lives in compute_outputs()
-// at lines ~95-99 below (wave32 / prefill / MUL_MAT_ID). Verified mathematically:
-// tid in [0,32) → (tid >> 4) is 0 for tid<16 and 1 for tid>=16, exactly the d0/d1
-// split, and the array-index form defeats mesa's unsigned-upper-bound ternary
-// coalescing failure.
-//
-// Wave64 decode (compute_outputs_cacheline in the glslh) currently uses the
-// un-coalesced (tid_in_half < 16u) ? d0 : d1 ternary antipattern. Deferred —
-// the glslh is another agent's territory.
-//
-// No additional .glslh header is needed: the existing mul_mat_vec_tq4_1s.glslh
-// supplies compute_outputs_cacheline, TQ4_CENTROIDS_SCALED, TQ4_SIGNS, and the
-// shared base.
+// Lloyd-Max centroids for TQ4_1S (4-bit, 16 levels) — N(0, 1) optimal
+// Pre-multiplied by 1/√32 to save 1 multiply per dequant.
+// ponytail: flat float[16] is better than vec4[4] pack — the 2-level index
+// (idx>>2, idx&3) increases VGPR pressure from 42 to 63.
+const float TQ4_CENTROIDS_SCALED[16] = float[16](
+    -0.48305823, -0.36575399, -0.28603282, -0.22207236,
+    -0.16658375, -0.11609969, -0.06859784, -0.02269724,
+     0.02269724,  0.06859784,  0.11609969,  0.16658375,
+     0.22207236,  0.28603282,  0.36575399,  0.48305823
+);
+
+// WHT sign pattern for 32-element blocks (shared by TQ3 and TQ4)
+const float TQ4_SIGNS[32] = float[32](
+    +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+    -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+    -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+    -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0
+);
 
 // See the commit message on a850ccc for the full derivation and portability
 // rationale.  Short version: pre-rotate the activation block via forward WHT
@@ -114,18 +110,9 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         float w_vals[NUM_ROWS];
         for (uint n = 0; n < num_rows; ++n) {
             const uint ib   = w_base + n * num_blocks_per_row + blk;
-            // ponytail: PR #21751 coalesce — read both fp16 scales unconditionally
-            // (adjacent fields, 4-byte aligned in the 20-byte block → mesa coalesces to one
-            // 32-bit SSBO load). Then index via constant array. Eliminates the `?:` ternary
-            // that mesa's unsigned-upper-bound analysis can't fold (forces 3 un-coalesced
-            // loads). tid >> 4u == (tid < 16u ? 0 : 1) for tid in [0, 32).
-            //
-            // Verified for wave32 (the only WG size that runs this body per
-            // tq4_1s_wg_size=32 dispatch in ggml-vulkan.cpp:4351).
             const float d0 = float(data_a[ib].d0);
             const float d1 = float(data_a[ib].d1);
-            const float ds[2] = float[2](d0, d1);
-            const float d  = ds[tid >> 4u];
+            const float d  = (tid < 16u) ? d0 : d1;
             const uint qbyte = uint(data_a[ib].qs[byte_idx]);
             const uint idx   = (qbyte >> nibble_shift) & 0xFu;
             w_vals[n] = TQ4_CENTROIDS_SCALED[idx] * d;
@@ -143,6 +130,170 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
+
+#if !defined(MUL_MAT_ID)
+// ponytail: Packet 2 (Z5 fallback — loop-overhead amortization on top of Path F).
+// Path F = 64 threads (wave64), reads 32 bytes qs per super-iter covering 2 TQ4 blocks.
+// Packet 2 (Z5) = same Path F body inlined TWICE per outer iter → 4 blocks per outer iter.
+// This halves the outer-loop iteration count (nbpr/4 instead of nbpr/2), reducing loop-
+// overhead instructions. The BW transaction count is unchanged: still 2 transactions per
+// super-iter, 2 super-iters per outer iter = same total BW as Path F.
+//
+// Honest expectation: ~1-3 % per-call matvec gain (loop-overhead only), 0 % wall tg128
+// (matvec is not the wall per Finding 6 in 045-gfx1103-research.md). The TRUE 64-byte
+// cache-line matvec (1 transaction per 4 blocks) requires re-quantizing TQ4_1S to pack
+// qs contiguously — out of scope for this packet (would touch ggml-turbo-quant.c).
+//
+// Tail logic covers all nbpr % 4 cases:
+//   nbpr % 4 == 0 → no tail
+//   nbpr % 4 == 1 → 1 leftover block (existing Path F tail)
+//   nbpr % 4 == 2 → 2 leftover blocks (1 Path F super-iter)
+//   nbpr % 4 == 3 → both tails fire (2-block super-iter + 1-block tail)
+//
+// Only compiled when MUL_MAT_ID is not defined (ID path keeps the original body).
+void compute_outputs_cacheline(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint nbpr         = p.ncols / 32u;
+    const uint half_blk         = tid / 32u;            // 0 or 1
+    const uint tid_in_half  = tid & 31u;            // 0..31
+    const uint byte_idx     = tid / 2u;            // 0..31, &15u caps to block's 16-byte qs
+    const uint nibble_shift = (tid & 1u) * 4u;
+    const float sign_tid    = TQ4_SIGNS[tid & 31u]; // wrap: both halves share the 32-element sign
+    const uint w_base       = a_offset + first_row * nbpr;
+
+    // Packet 2: round down to multiple of 4 instead of 2. Each outer iter processes
+    // 4 blocks via 2 inlined Path F sub-iters (A: blk+half_blk for blocks blk,blk+1;
+    // B: blk+2+half_blk for blocks blk+2, blk+3).
+    const uint nbpr_aligned_4 = nbpr & ~3u;
+
+    [[unroll]] for (uint blk_quad = 0u; blk_quad < nbpr_aligned_4; blk_quad += 4u) {
+
+        // --- Sub-iter A: blocks blk_quad (half 0) and blk_quad+1 (half 1) ---
+        {
+            const uint b_blk  = blk_quad + half_blk;  // blk_quad or blk_quad+1
+            const uint b_base = b_offset + b_blk * 32u;
+
+            float act = float(data_b[b_base + tid_in_half]) * sign_tid;
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                const float partner_val = subgroupShuffleXor(act, step);
+                act = ((tid_in_half & step) == 0u) ? (act + partner_val) : (partner_val - act);
+            }
+            barrier();
+
+            const uint w_blk = blk_quad + half_blk;
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint ib = w_base + n * nbpr + w_blk;
+                    const float d0 = float(data_a[ib].d0);
+                    const float d1 = float(data_a[ib].d1);
+                    const float d  = (tid_in_half < 16u) ? d0 : d1;
+                    const uint qbyte = uint(data_a[ib].qs[byte_idx & 15u]);
+                    const uint idx   = (qbyte >> nibble_shift) & 0xFu;
+                    const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                    temp[0u][n] += FLOAT_TYPE(w * act);
+                }
+            }
+        }
+
+        // --- Sub-iter B: blocks blk_quad+2 (half 0) and blk_quad+3 (half 1) ---
+        {
+            const uint b_blk  = blk_quad + 2u + half_blk;
+            const uint b_base = b_offset + b_blk * 32u;
+
+            float act = float(data_b[b_base + tid_in_half]) * sign_tid;
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                const float partner_val = subgroupShuffleXor(act, step);
+                act = ((tid_in_half & step) == 0u) ? (act + partner_val) : (partner_val - act);
+            }
+            barrier();
+
+            const uint w_blk = blk_quad + 2u + half_blk;
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint ib = w_base + n * nbpr + w_blk;
+                    const float d0 = float(data_a[ib].d0);
+                    const float d1 = float(data_a[ib].d1);
+                    const float d  = (tid_in_half < 16u) ? d0 : d1;
+                    const uint qbyte = uint(data_a[ib].qs[byte_idx & 15u]);
+                    const uint idx   = (qbyte >> nibble_shift) & 0xFu;
+                    const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                    temp[0u][n] += FLOAT_TYPE(w * act);
+                }
+            }
+        }
+    }
+
+    // Tail A: 2 leftover blocks if nbpr & 2 != 0. 1 Path F super-iter (lanes 0..31 = block,
+    // lanes 32..63 = block+1). Covers nbpr % 4 == 2 and == 3.
+    if ((nbpr & 2u) != 0u) {
+        const uint blk = nbpr - 2u;
+        const uint b_blk  = blk + half_blk;
+        const uint b_base = b_offset + b_blk * 32u;
+
+        float act = float(data_b[b_base + tid_in_half]) * sign_tid;
+        [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+            const float partner_val = subgroupShuffleXor(act, step);
+            act = ((tid_in_half & step) == 0u) ? (act + partner_val) : (partner_val - act);
+        }
+        barrier();
+
+        const uint w_blk = blk + half_blk;
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uint ib = w_base + n * nbpr + w_blk;
+                const float d0 = float(data_a[ib].d0);
+                const float d1 = float(data_a[ib].d1);
+                const float d  = (tid_in_half < 16u) ? d0 : d1;
+                const uint qbyte = uint(data_a[ib].qs[byte_idx & 15u]);
+                const uint idx   = (qbyte >> nibble_shift) & 0xFu;
+                const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                temp[0u][n] += FLOAT_TYPE(w * act);
+            }
+        }
+    }
+
+    // Tail B: 1 leftover block if nbpr & 1 != 0. Lanes 0..31 process it; lanes 32..63 skip.
+    // Covers nbpr % 4 == 1 and == 3.
+    if ((nbpr & 1u) != 0u) {
+        if (tid < 32u) {
+            const uint blk = nbpr - 1u;
+            const uint b_base = b_offset + blk * 32u;
+            float act = float(data_b[b_base + tid]) * sign_tid; // tid<32, sign_tid = TQ4_SIGNS[tid]
+            [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+                const float partner_val = subgroupShuffleXor(act, step);
+                act = ((tid & step) == 0u) ? (act + partner_val) : (partner_val - act);
+            }
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint ib = w_base + n * nbpr + blk;
+                    const float d0 = float(data_a[ib].d0);
+                    const float d1 = float(data_a[ib].d1);
+                    const float d  = (tid < 16u) ? d0 : d1;
+                    const uint qbyte = uint(data_a[ib].qs[tid / 2u]);
+                    const uint idx   = (qbyte >> ((tid & 1u) * 4u)) & 0xFu;
+                    const float w    = TQ4_CENTROIDS_SCALED[idx] * d;
+                    temp[0u][n] += FLOAT_TYPE(w * act);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // reduce_result with BLOCK_SIZE=64 (spec const 0) + USE_SUBGROUP_ADD_NO_SHMEM (from
+    // tq4_1s_decode_reduc=SUBGROUP) uses pure subgroupAdd over 64 lanes; tmpsh unused.
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+#endif // !MUL_MAT_ID
 
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);

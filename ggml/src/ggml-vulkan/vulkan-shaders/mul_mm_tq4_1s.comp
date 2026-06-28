@@ -6,6 +6,7 @@
 // writes fp16 A-tile to shared memory for WMMA accumulation.
 // Eliminates the two-step fallback (standalone dequant → F16 temp → generic mul_mm).
 
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #ifdef FLOAT16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -19,6 +20,7 @@
 #if defined(COOPMAT) || defined(MUL_MAT_ID_USE_SUBGROUPS)
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #endif
 
 #ifdef MUL_MAT_ID
@@ -26,6 +28,24 @@
 #endif
 
 #include "types.glsl"
+
+#ifndef LOAD_VEC_B
+#define LOAD_VEC_B 1
+#endif
+
+#if !defined(ALIGNED)
+#define LOAD_VEC_BATCH_B 2
+#else
+#define LOAD_VEC_BATCH_B 1
+#endif
+
+#if !defined(FLOAT_TYPEV8)
+#define FLOAT_TYPEV8 mat2x4
+#endif
+
+#if !defined(TO_FLOAT_TYPE)
+#define TO_FLOAT_TYPE FLOAT_TYPE
+#endif
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -89,11 +109,6 @@ layout (constant_id = 10) const uint WARP = 32;
 
 shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
 shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
-
-// HW-V-baseline: WHT intermediate in LDS (replaces 32-VGPR float buf[32])
-// 32 threads per TQ4 block × BM rows, but only 8 rows processed per pass.
-// Allocate for worst case (all rows active): BM * BK floats = 128*32 = 4096 floats = 16 KB.
-shared float wht_scratch[BM * BK];
 
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
@@ -215,19 +230,22 @@ void main() {
     const uint end_k = min(p.K, (ik + 1) * p.k_split);
 #endif
 
+    const uint stride_a_blocks = p.stride_a / BK;
+    const uint batch_stride_a_blocks = p.batch_stride_a / BK;
+
     uint pos_a =
 #ifdef MUL_MAT_ID
-        expert_idx * p.batch_stride_a +
+        expert_idx * batch_stride_a_blocks +
 #else
-        batch_idx_a * p.batch_stride_a +
+        batch_idx_a * batch_stride_a_blocks +
 #endif
-        ir * BM * p.stride_a + start_k;
+        ir * BM * stride_a_blocks + start_k / BK;
 
     uint pos_b =
 #ifdef MUL_MAT_ID
         0;
 #else
-        batch_idx * p.batch_stride_b + ic * BN * p.stride_b + start_k;
+        (batch_idx * p.batch_stride_b + ic * BN * p.stride_b + start_k) / LOAD_VEC_B;
 #endif
 
 #ifdef COOPMAT
@@ -241,98 +259,42 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
-        // --- Load A-tile: TQ4_1S blocks → dequant → WHT → shared memory ---
-        // HW-V-baseline: 256 threads, 32 per TQ4 block, 8 blocks per pass.
-        // All 32 threads dequantize to LDS scratch, then ONE thread per block runs
-        // the sequential WHT butterfly in-register (float buf[32]).
-        // The 32 WHT outputs are stored in buf_a using the STANDARD mul_mm layout:
-        //   buf_a[col * SHMEM_STRIDE + row] = pair(wht_out[row*32 + col*2], wht_out[row*32 + col*2+1])
-        // This matches how coopMatLoad with stride=SHMEM_STRIDE reads elements.
+        // --- Load A-tile: TQ4_1S dequant (centroid*scale only, NO WHT/signs/INV_SQRT32) ---
+        // B-side WHT: A_orig = signs*INV_SQRT32*WHT(A_wht); by WHT orthogonality the
+        // matmul A_orig·B == A_wht·B' with B' = INV_SQRT32*WHT(signs*B) (numpy-verified,
+        // max abs 5e-14). So A-load stores bare A_wht = centroid*d; the WHT moves to
+        // the B-side pass below and is amortized over all M rows. Even-tid threads
+        // pack the (tid, tid+1) element pair from one nibble byte into one f16vec2
+        // slot; odd-tid threads idle. rows_per_pass=BLOCK_SIZE/BK; disjoint rows/slots
+        // so no internal barrier is needed.
         {
             const uint lane = gl_LocalInvocationIndex;
             const uint tid  = lane % BK;  // 0..31 element index within TQ4 block
+            const uint rows_per_pass = BLOCK_SIZE / BK;
 
-            for (uint pass = lane / BK; pass < BM; pass += BLOCK_SIZE / BK) {
-                const uint row = pass;  // 0..127
-                const uint global_row = ir * BM + row;
-                const uint k_block_idx = (block - start_k) / BK;
-
-                // Stage 1: dequantize and write 32 elements to LDS scratch
-                float wht_val = 0.0;
-                if (global_row < p.M && block < end_k) {
-                    const uint a_idx = pos_a + row * p.stride_a + k_block_idx;
-                    const float d0 = float(data_a[a_idx].d0);
-                    const float d1 = float(data_a[a_idx].d1);
-                    const uint byte_idx = tid / 2u;
-                    const uint nibble_shift = (tid & 1u) * 4u;
-                    const uint centroid_idx = (uint(data_a[a_idx].qs[byte_idx]) >> nibble_shift) & 0xFu;
-                    const float d = (tid < 16u) ? d0 : d1;
-                    wht_val = TQ4_CENTROIDS[centroid_idx] * d;
-                }
-                wht_scratch[row * BK + tid] = wht_val;
-                barrier();
-
-                // Stage 2: one thread per block runs the sequential WHT butterfly.
-                if (tid == 0u) {
-                    float buf[32];
-                    for (uint j = 0u; j < 32u; j++) {
-                        buf[j] = wht_scratch[row * BK + j];
-                    }
-                    for (uint step = 1u; step < 32u; step <<= 1u) {
-                        for (uint i = 0u; i < 32u; i += step * 2u) {
-                            for (uint j = i; j < i + step; j++) {
-                                const float a = buf[j];
-                                const float b = buf[j + step];
-                                buf[j]        = a + b;
-                                buf[j + step] = a - b;
-                            }
-                        }
-                    }
-                    // Normalize and pair-pack into buf_a.
-                    // Each FLOAT_TYPEV2 slot holds 2 consecutive WHT outputs.
-                    // coopMatLoad with i/2 reads 16 consecutive slots = 32 fp16.
-                    if (global_row < p.M) {
-                        for (uint j = 0u; j < BK / 2; j++) {
-                            const uint e0 = j * 2u;
-                            const uint e1 = j * 2u + 1u;
-                            buf_a[row * SHMEM_STRIDE + j] = FLOAT_TYPEV2(
-                                FLOAT_TYPE(buf[e0] * INV_SQRT32 * TQ4_SIGNS[e0]),
-                                FLOAT_TYPE(buf[e1] * INV_SQRT32 * TQ4_SIGNS[e1])
-                            );
-                        }
+            for (uint base = 0u; base < BM; base += rows_per_pass) {
+                const uint row = base + lane / BK;
+                if (row < BM && (tid & 1u) == 0u) {
+                    const uint slot = tid / 2u;  // buf_a pair slot; holds elements tid & tid+1
+                    const uint global_row = ir * BM + row;
+                    if (global_row < p.M && block < end_k) {
+                        const uint a_idx = pos_a + row * stride_a_blocks;
+                        const float d0 = float(data_a[a_idx].d0);
+                        const float d1 = float(data_a[a_idx].d1);
+                        // Elements tid and tid+1 share nibble byte tid/2 (the d0/d1
+                        // boundary 15|16 falls between bytes 7|8, so each byte is single-d).
+                        const uint bidx = tid / 2u;
+                        const uint qsb = uint(data_a[a_idx].qs[bidx]);
+                        const uint nib0 = qsb & 0xFu;            // element tid  (low nibble)
+                        const uint nib1 = (qsb >> 4u) & 0xFu;    // element tid+1 (high nibble)
+                        const float dt  = (tid < 16u)       ? d0 : d1;
+                        const float dt1 = (tid + 1u < 16u)  ? d0 : d1;
+                        buf_a[row * SHMEM_STRIDE + slot] = FLOAT_TYPEV2(
+                            FLOAT_TYPE(TQ4_CENTROIDS[nib0] * dt),
+                            FLOAT_TYPE(TQ4_CENTROIDS[nib1] * dt1)
+                        );
                     } else {
-                        for (uint j = 0u; j < BK / 2; j++) {
-                            buf_a[row * SHMEM_STRIDE + j] = FLOAT_TYPEV2(FLOAT_TYPE(0.0));
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- Load B-tile: standard fp16/scalar loading ---
-        // Adapted from mul_mm.comp scalar path for BK=32.
-        // NOTE: stride_b in push constants is ne10 (=K), but mul_mm loads B
-        // elements with a hardcoded stride of 2 (two consecutive fp16 per slot).
-        {
-            const uint lane = gl_LocalInvocationIndex;
-            const uint loadr = lane % (BK / 2);
-            const uint loadc = lane / (BK / 2);
-            const uint loadstride = gl_WorkGroupSize.x / (BK / 2);
-
-            for (uint l = 0u; l < BN; l += loadstride) {
-                const uint col = loadc + l;
-                if (col < BN) {
-                    const uint b_idx = pos_b + col * p.stride_b + loadr * 2;
-                    // Store at standard mul_mm position (col * SHMEM_STRIDE + loadr)
-                    // so coopMatLoad with i/2 reads correct elements.
-                    const uint buf_idx = col * SHMEM_STRIDE + loadr;
-
-                    if (col < p.N && block + loadr * 2 + 1 < end_k) {
-                        buf_b[buf_idx] = FLOAT_TYPEV2(FLOAT_TYPE(data_b[b_idx]), FLOAT_TYPE(data_b[b_idx + 1]));
-                    } else if (col < p.N && block + loadr * 2 < end_k) {
-                        buf_b[buf_idx] = FLOAT_TYPEV2(FLOAT_TYPE(data_b[b_idx]), FLOAT_TYPE(0.0));
-                    } else {
-                        buf_b[buf_idx] = FLOAT_TYPEV2(FLOAT_TYPE(0.0));
+                        buf_a[row * SHMEM_STRIDE + slot] = FLOAT_TYPEV2(FLOAT_TYPE(0.0));
                     }
                 }
             }
@@ -340,11 +302,102 @@ void main() {
 
         barrier();
 
+        // --- Load B-tile: generic mul_mm layout, specialized for BK=32 ---
+        {
+            const uint lane = gl_LocalInvocationIndex;
+            const uint loadr = lane % (BK / LOAD_VEC_B / LOAD_VEC_BATCH_B);
+            const uint loadc = lane / (BK / LOAD_VEC_B / LOAD_VEC_BATCH_B);
+            const uint loadstride = gl_WorkGroupSize.x * LOAD_VEC_B * LOAD_VEC_BATCH_B / BK;
+
+            for (uint l = 0u; l < BN; l += loadstride) {
+                const uint col = loadc + l;
+                if (col < BN) {
+#if LOAD_VEC_B == 8
+                    const uint b_idx = pos_b + col * p.stride_b / LOAD_VEC_B + loadr;
+                    const uint buf_idx = col * SHMEM_STRIDE + loadr * LOAD_VEC_B / 2;
+
+                    FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[b_idx]);
+                    buf_b[buf_idx + 0] = bb[0].xy;
+                    buf_b[buf_idx + 1] = bb[0].zw;
+                    buf_b[buf_idx + 2] = bb[1].xy;
+                    buf_b[buf_idx + 3] = bb[1].zw;
+#elif LOAD_VEC_B == 4
+                    const uint b_idx = pos_b + col * p.stride_b / LOAD_VEC_B + loadr;
+                    const uint buf_idx = col * SHMEM_STRIDE + loadr * LOAD_VEC_B / 2;
+
+                    FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[b_idx]);
+                    buf_b[buf_idx + 0] = bb.xy;
+                    buf_b[buf_idx + 1] = bb.zw;
+#else
+                    const uint b_idx = pos_b + col * p.stride_b + loadr * 2;
+                    const uint buf_idx = col * SHMEM_STRIDE + loadr;
+
+                    if (col < p.N && block + loadr * 2 + 1 < end_k) {
+                        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[b_idx]), TO_FLOAT_TYPE(data_b[b_idx + 1]));
+                    } else if (col < p.N && block + loadr * 2 < end_k) {
+                        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[b_idx]), FLOAT_TYPE(0.0));
+                    } else {
+                        buf_b[buf_idx] = FLOAT_TYPEV2(FLOAT_TYPE(0.0));
+                    }
+#endif
+                }
+            }
+        }
+
+        barrier();
+
+        // --- B-WHT pass: transform raw B (in buf_b) into B' = INV_SQRT32*WHT(signs*B) ---
+        // B-side WHT (numpy-verified bit-exact vs dequant_tq4_1s sequential butterfly).
+        // Gated under COOPMAT: the coopmat2 build of this file has COOPMAT undefined
+        // and never accumulates (no sums/store), so skipping the WHT there is harmless
+        // and keeps it compiling (subgroup ops need the COOPMAT-gated extensions).
+#ifdef COOPMAT
+        {
+            const uint lid = gl_LocalInvocationIndex;
+            const uint groups_per_pass = BLOCK_SIZE / 32u;  // columns processed per pass
+            const uint k = lid % 32u;                        // element index within the 32-K block
+            const uint half32 = gl_SubgroupInvocationID / 32u;
+
+            for (uint base = 0u; base < BN; base += groups_per_pass) {
+                const uint col = base + lid / 32u;
+
+                // Read raw B element k of column col. Ternary select keeps the
+                // subgroupShuffle below in uniform control flow (no divergence).
+                float val = 0.0;
+                if (col < BN) {
+                    const FLOAT_TYPEV2 pr = buf_b[col * SHMEM_STRIDE + k / 2u];
+                    val = float((k & 1u) == 0u ? pr.x : pr.y);
+                }
+                val *= TQ4_SIGNS[k];
+
+                // 5-stage in-register WHT via subgroup shuffle. Partner index XOR<=16
+                // stays inside the 32-lane half, so a wave64 runs two independent 32-pt
+                // WHTs without cross-talk. Sign convention (verified): high-bit lane
+                // takes (partner - val), matching the sequential buf[j+step]=a-b.
+                [[unroll]] for (uint s = 0u; s < 5u; s++) {
+                    const float partner = subgroupShuffle(val, half32 * 32u + (k ^ (1u << s)));
+                    val = (((k >> s) & 1u) != 0u) ? (partner - val) : (val + partner);
+                }
+                val *= INV_SQRT32;
+
+                // Pack (val[k], val[k+1]) back into the f16vec2 slot; only even-k writes.
+                // Clamp next_id so lane k=31 / half32=1 never indexes >= gl_SubgroupSize.
+                uint next_id = half32 * 32u + k + 1u;
+                next_id = (next_id >= gl_SubgroupSize) ? (gl_SubgroupSize - 1u) : next_id;
+                const float nextv = subgroupShuffle(val, next_id);
+                if (col < BN && (k & 1u) == 0u) {
+                    buf_b[col * SHMEM_STRIDE + k / 2u] = FLOAT_TYPEV2(FLOAT_TYPE(val), FLOAT_TYPE(nextv));
+                }
+            }
+        }
+        barrier();
+#endif
+
         // Advance positions
         // pos_a is in block_tq4_1s units (1 block = 32 elements); advance by 1 block
         pos_a += 1;
-        // pos_b is in fp16 element units; advance by BK elements
-        pos_b += BK;
+        // pos_b is in B_TYPE vector units; advance by one K tile.
+        pos_b += BK / LOAD_VEC_B;
 
         // --- WMMA accumulation ---
 #ifdef COOPMAT
@@ -363,6 +416,14 @@ void main() {
 
         barrier();
     }
+
+#if defined(COOPMAT) && defined(ACC_TYPE_MAX)
+    [[unroll]] for (uint j = 0; j < cms_per_row * cms_per_col; j++) {
+        [[unroll]] for (uint i = 0; i < sums[j].length(); ++i) {
+            sums[j][i] = clamp(sums[j][i], -ACC_TYPE_MAX, ACC_TYPE_MAX);
+        }
+    }
+#endif
 
     // --- Epilogue: store results ---
     const uint dr = ir * BM + warp_r * WM;
