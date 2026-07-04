@@ -603,8 +603,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 void process_shaders() {
     // matmul
 
-    // TQ4_1S fused coopmat mul_mm: uses a dedicated shader (mul_mm_tq4_1s.comp)
-    // because TQ4_1S requires WHT butterfly during A-tile load, which the generic
+    // TQ*_1S fused coopmat mul_mm: uses dedicated shaders (mul_mm_tq{2,4}_1s.comp)
+    // because TQ*_1S requires WHT butterfly during A-tile load, which the generic
     // mul_mm.comp cannot do. Generated here, outside the matmul_shaders loop,
     // to avoid generating unwanted MUL_MAT_ID variants.
     {
@@ -645,6 +645,16 @@ void process_shaders() {
                     {{"DATA_A_TQ4_1S", "1"}, {"COOPMAT", "1"}, {"B_TYPE", "f16mat2x4"}, {"D_TYPE", "float"},
                      {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "8"}, {"ALIGNED", "1"}}),
                 true, true, false, f16acc);
+            string_to_spv("matmul_tq4_1s_prewht_f16", "mul_mm_tq4_1s.comp",
+                merge_maps(tq4_f16_acc_base,
+                    {{"DATA_A_TQ4_1S", "1"}, {"COOPMAT", "1"}, {"TQ_PREWHT_B", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}}),
+                true, true, false, f16acc);
+            string_to_spv("matmul_tq4_1s_prewht_f16_aligned", "mul_mm_tq4_1s.comp",
+                merge_maps(tq4_f16_acc_base,
+                    {{"DATA_A_TQ4_1S", "1"}, {"COOPMAT", "1"}, {"TQ_PREWHT_B", "1"}, {"B_TYPE", "f16mat2x4"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "8"}, {"ALIGNED", "1"}}),
+                true, true, false, f16acc);
             // coopmat2 path (VK_NV_cooperative_matrix2)
             string_to_spv("matmul_tq4_1s_f16", "mul_mm_tq4_1s.comp",
                 merge_maps(tq4_f16_acc_base,
@@ -654,6 +664,61 @@ void process_shaders() {
             string_to_spv("matmul_tq4_1s_f16_aligned", "mul_mm_tq4_1s.comp",
                 merge_maps(tq4_f16_acc_base,
                     {{"DATA_A_TQ4_1S", "1"}, {"B_TYPE", "f16vec4"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "4"}, {"ALIGNED", "1"}}),
+                true, false, true, f16acc);
+        }
+
+        for (const bool& f16acc : {false, true}) {
+            std::map<std::string, std::string> tq2_f16_acc_base = tq4_f16_base;
+            tq2_f16_acc_base["ACC_TYPE"] = f16acc ? "float16_t" : "float";
+            tq2_f16_acc_base["ACC_TYPEV2"] = f16acc ? "f16vec2" : "vec2";
+            if (f16acc) {
+                tq2_f16_acc_base["ACC_TYPE_MAX"] = "float16_t(65504.0)";
+            }
+
+            // KHR coopmat path selected for TQ2_1S uses F32 B activations and
+            // stores both A and B in fp16 shared tiles, matching generic mul_mm.
+            string_to_spv("matmul_tq2_1s_f32", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"COOPMAT", "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}}),
+                true, true, false, f16acc);
+            string_to_spv("matmul_tq2_1s_f32_aligned", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"COOPMAT", "1"}, {"B_TYPE", "mat2x4"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "8"}, {"ALIGNED", "1"}}),
+                true, true, false, f16acc);
+
+            // Non-coopmat2 coopmat path (VK_KHR_cooperative_matrix)
+            string_to_spv("matmul_tq2_1s_f16", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"COOPMAT", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}}),
+                true, true, false, f16acc);
+            string_to_spv("matmul_tq2_1s_f16_aligned", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"COOPMAT", "1"}, {"B_TYPE", "f16mat2x4"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "8"}, {"ALIGNED", "1"}}),
+                true, true, false, f16acc);
+            string_to_spv("matmul_tq2_1s_prewht_f16", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"COOPMAT", "1"}, {"TQ_PREWHT_B", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}}),
+                true, true, false, f16acc);
+            string_to_spv("matmul_tq2_1s_prewht_f16_aligned", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"COOPMAT", "1"}, {"TQ_PREWHT_B", "1"}, {"B_TYPE", "f16mat2x4"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "8"}, {"ALIGNED", "1"}}),
+                true, true, false, f16acc);
+            // coopmat2 path (VK_NV_cooperative_matrix2)
+            string_to_spv("matmul_tq2_1s_f16", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"},
+                     {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}}),
+                true, false, true, f16acc);
+            string_to_spv("matmul_tq2_1s_f16_aligned", "mul_mm_tq2_1s.comp",
+                merge_maps(tq2_f16_acc_base,
+                    {{"DATA_A_TQ2_1S", "1"}, {"B_TYPE", "f16vec4"}, {"D_TYPE", "float"},
                      {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "4"}, {"ALIGNED", "1"}}),
                 true, false, true, f16acc);
         }
@@ -861,6 +926,7 @@ void process_shaders() {
 
     // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
     string_to_spv("turbo_wht", "turbo_wht.comp", {});
+    string_to_spv("tq_wht_b_f32_f16", "tq_wht_b.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

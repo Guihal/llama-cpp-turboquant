@@ -25,6 +25,9 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
+#include "sampling.h"
+#include "speculative.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -357,6 +360,7 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    std::string                      spec_type;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -401,6 +405,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* spec_type            */ "none",
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -461,6 +466,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                              (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
     printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --spec-type <type>                         speculative decoding type (default: none)\n");
+    printf("                                              types: none,draft-simple,draft-mtp,...\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -839,6 +846,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "--spec-type") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.spec_type = argv[i];
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1424,6 +1437,8 @@ struct test {
     int                      n_gen;
     int                      n_depth;
     std::string              test_time;
+    std::string              spec_type;
+    double                   spec_accept_rate = -1.0;
     std::vector<uint64_t>    samples_ns;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
@@ -1519,7 +1534,8 @@ struct test {
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts",
+            "spec_type",      "spec_accept_rate"
         };
         return fields;
     }
@@ -1538,7 +1554,7 @@ struct test {
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "spec_accept_rate") {
             return FLOAT;
         }
         return STRING;
@@ -1621,7 +1637,9 @@ struct test {
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
-                                            std::to_string(stdev_ts()) };
+                                            std::to_string(stdev_ts()),
+                                            spec_type,
+                                            spec_accept_rate >= 0 ? std::to_string(spec_accept_rate) : "" };
         return values;
     }
 
@@ -1802,6 +1820,12 @@ struct markdown_printer : public printer {
         if (field == "test") {
             return 15;
         }
+        if (field == "spec_type") {
+            return 10;
+        }
+        if (field == "spec_accept_rate") {
+            return 8;
+        }
         if (field == "no_op_offload") {
             return 4;
         }
@@ -1862,6 +1886,12 @@ struct markdown_printer : public printer {
         }
         if (field == "fit_min_ctx") {
             return "fitc";
+        }
+        if (field == "spec_type") {
+            return "spec";
+        }
+        if (field == "spec_accept_rate") {
+            return "accept%";
         }
         return field;
     }
@@ -2071,6 +2101,67 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
+struct seq_checkpoint {
+    std::vector<uint8_t> tgt;
+    std::vector<uint8_t> dft;
+
+    void save(llama_context * ctx, llama_context * ctx_dft, llama_seq_id seq_id) {
+        const size_t tgt_size = llama_state_seq_get_size(ctx, seq_id);
+        tgt.resize(tgt_size);
+        if (llama_state_seq_get_data(ctx, tgt.data(), tgt_size, seq_id) != tgt_size) {
+            GGML_ABORT("target checkpoint size mismatch\n");
+        }
+
+        const size_t dft_size = llama_state_seq_get_size(ctx_dft, seq_id);
+        dft.resize(dft_size);
+        if (llama_state_seq_get_data(ctx_dft, dft.data(), dft_size, seq_id) != dft_size) {
+            GGML_ABORT("draft checkpoint size mismatch\n");
+        }
+    }
+
+    void restore_tgt(llama_context * ctx, llama_seq_id seq_id) const {
+        llama_memory_clear(llama_get_memory(ctx), false);
+        if (!tgt.empty() && llama_state_seq_set_data(ctx, tgt.data(), tgt.size(), seq_id) != tgt.size()) {
+            GGML_ABORT("target checkpoint restore mismatch\n");
+        }
+    }
+
+    void restore_dft(llama_context * ctx_dft, llama_seq_id seq_id) const {
+        llama_memory_clear(llama_get_memory(ctx_dft), false);
+        if (!dft.empty() && llama_state_seq_set_data(ctx_dft, dft.data(), dft.size(), seq_id) != dft.size()) {
+            GGML_ABORT("draft checkpoint restore mismatch\n");
+        }
+    }
+
+    void restore(llama_context * ctx, llama_context * ctx_dft, llama_seq_id seq_id) const {
+        restore_tgt(ctx, seq_id);
+        restore_dft(ctx_dft, seq_id);
+    }
+};
+
+static llama_batch make_token_batch(
+        const llama_token * tokens,
+        int32_t             n_tokens,
+        llama_pos           pos0,
+        llama_seq_id        seq_id,
+        bool                logits_all) {
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    common_batch_clear(batch);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        common_batch_add(batch, tokens[i], pos0 + i, { seq_id }, logits_all || i == n_tokens - 1);
+    }
+
+    return batch;
+}
+
+static void clear_context_memory(llama_context * ctx, llama_context * ctx_dft) {
+    llama_memory_clear(llama_get_memory(ctx), false);
+    if (ctx_dft) {
+        llama_memory_clear(llama_get_memory(ctx_dft), false);
+    }
+}
+
 static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
@@ -2100,6 +2191,46 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
+// Prompt processing that also mirrors KV to the draft context (needed for MTP).
+static bool test_prompt_with_spec(
+        llama_context * ctx, common_speculative * spec,
+        int n_prompt, int n_batch, int n_threads) {
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    const llama_model * model   = llama_get_model(ctx);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> tokens(n_batch);
+
+    int n_processed = 0;
+
+    while (n_processed < n_prompt) {
+        int n_tokens = std::min(n_prompt - n_processed, n_batch);
+        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+        for (int i = 1; i < n_tokens; i++) {
+            tokens[i] = std::rand() % n_vocab;
+        }
+        llama_batch batch = make_token_batch(tokens.data(), n_tokens, n_processed, 0, false);
+        int res = llama_decode(ctx, batch);
+        if (res != 0) {
+            llama_batch_free(batch);
+            fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
+            return false;
+        }
+        if (!common_speculative_process(spec, batch)) {
+            llama_batch_free(batch);
+            fprintf(stderr, "%s: failed to process speculative prompt batch\n", __func__);
+            return false;
+        }
+        llama_batch_free(batch);
+        n_processed += n_tokens;
+    }
+
+    llama_synchronize(ctx);
+    return true;
+}
+
 static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
@@ -2118,6 +2249,154 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
         llama_synchronize(ctx);
         token = std::rand() % n_vocab;
     }
+    return true;
+}
+
+// Speculative generation using common_speculative API.
+// Returns n_drafted (total tokens proposed by draft) and n_accepted (tokens accepted by target).
+// Flow matches server: draft → verify batch → target decode → process → sample+accept
+static bool test_gen_speculative(
+        llama_context * ctx, llama_context * ctx_dft, common_speculative * spec,
+        int n_gen, int n_threads,
+        int & n_drafted, int & n_accepted) {
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    const llama_model * model   = llama_get_model(ctx);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+    const llama_seq_id  seq_id  = 0;
+
+    common_params_sampling sparams;
+    sparams.no_perf  = false;
+    sparams.top_k    = 1;
+    sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+    common_sampler_ptr smpl(common_sampler_init(model, sparams));
+
+    llama_token id_last = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    llama_pos   n_past  = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
+
+    llama_tokens prompt_tgt;
+    common_speculative_begin(spec, seq_id, prompt_tgt);
+
+    llama_tokens draft;
+    llama_tokens replay_draft;
+    n_drafted  = 0;
+    n_accepted = 0;
+
+    int n_generated = 0;
+
+    while (n_generated < n_gen) {
+        int n_remaining = n_gen - n_generated;
+
+        draft.clear();
+        seq_checkpoint ckpt;
+        bool have_ckpt = false;
+        bool replaying = false;
+
+        if (!replay_draft.empty()) {
+            draft = std::move(replay_draft);
+            replay_draft.clear();
+            replaying = true;
+            ckpt.save(ctx, ctx_dft, seq_id);
+            have_ckpt = true;
+        } else if (n_past > 0 && n_remaining > 1) {
+            ckpt.save(ctx, ctx_dft, seq_id);
+            have_ckpt = true;
+
+            common_speculative_get_draft_params(spec, seq_id) = {
+                /* .drafting = */ true,
+                /* .n_max    = */ std::min(8, n_remaining - 1),
+                /* .n_past   = */ n_past,
+                /* .id_last  = */ id_last,
+                /* .prompt   = */ &prompt_tgt,
+                /* .result   = */ &draft,
+            };
+            common_speculative_draft(spec);
+        }
+
+        if (!replaying) {
+            n_drafted += (int) draft.size();
+        }
+
+        if (draft.empty()) {
+            if (have_ckpt) {
+                ckpt.restore_dft(ctx_dft, seq_id);
+            }
+
+            llama_batch batch_tgt = make_token_batch(&id_last, 1, n_past, seq_id, true);
+            const int res = llama_decode(ctx, batch_tgt);
+            if (res != 0) {
+                llama_batch_free(batch_tgt);
+                fprintf(stderr, "%s: failed to decode fallback token, res = %d\n", __func__, res);
+                return false;
+            }
+            if (!common_speculative_process(spec, batch_tgt)) {
+                llama_batch_free(batch_tgt);
+                fprintf(stderr, "%s: failed to process fallback speculative token\n", __func__);
+                return false;
+            }
+            llama_batch_free(batch_tgt);
+
+            id_last = common_sampler_sample(smpl.get(), ctx, 0);
+            common_sampler_accept(smpl.get(), id_last, true);
+
+            n_generated++;
+            n_past++;
+            continue;
+        }
+
+        std::vector<int32_t> spec_i_batch;
+        llama_batch batch_verify = llama_batch_init((int) draft.size() + 1, 0, 1);
+        common_batch_clear(batch_verify);
+
+        spec_i_batch.push_back(batch_verify.n_tokens);
+        common_batch_add(batch_verify, id_last, n_past, { seq_id }, true);
+
+        for (size_t i = 0; i < draft.size(); i++) {
+            spec_i_batch.push_back(batch_verify.n_tokens);
+            common_batch_add(batch_verify, draft[i], n_past + (int) i + 1, { seq_id }, true);
+        }
+
+        int res = llama_decode(ctx, batch_verify);
+        if (res != 0) {
+            llama_batch_free(batch_verify);
+            fprintf(stderr, "%s: failed to decode speculative verify batch, res = %d\n", __func__, res);
+            return false;
+        }
+
+        common_sampler_ptr smpl_save(common_sampler_clone(smpl.get()));
+        auto accepted = common_sampler_sample_and_accept_n(smpl.get(), ctx, spec_i_batch, draft);
+        GGML_ASSERT(!accepted.empty());
+
+        const int n_accepted_batch = (int) accepted.size() - 1;
+        if (accepted.size() != draft.size() + 1) {
+            ckpt.restore(ctx, ctx_dft, seq_id);
+            smpl = std::move(smpl_save);
+            replay_draft = std::move(accepted);
+            llama_batch_free(batch_verify);
+            continue;
+        }
+
+        ckpt.restore_dft(ctx_dft, seq_id);
+
+        if (!common_speculative_process(spec, batch_verify)) {
+            llama_batch_free(batch_verify);
+            fprintf(stderr, "%s: failed to process speculative verify batch\n", __func__);
+            return false;
+        }
+        common_speculative_accept(spec, seq_id, n_accepted_batch);
+
+        llama_batch_free(batch_verify);
+
+        if (!replaying) {
+            n_accepted += n_accepted_batch;
+        }
+        n_generated += (int) accepted.size();
+        n_past      += (int) accepted.size();
+
+        id_last = accepted.back();
+    }
+
     return true;
 }
 
@@ -2207,6 +2486,16 @@ int main(int argc, char ** argv) {
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
+    // speculative decoding state
+    const bool use_spec = (params.spec_type == "draft-mtp");
+    llama_context * ctx_dft = nullptr;
+    common_speculative * spec = nullptr;
+    common_params_speculative spec_params;
+    if (use_spec) {
+        spec_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        spec_params.draft.n_max = 8;
+    }
+
     // store the llama_context state at the previous depth that we performed a test
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
     ctx_state cstate;
@@ -2220,6 +2509,12 @@ int main(int argc, char ** argv) {
         }
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
+
+        // MTP needs n_outputs_max to accommodate draft tokens (n_max=8 here)
+        // output buffer will be resized on first decode after set_embeddings_nextn()
+        if (use_spec) {
+            cparams.n_outputs_max = std::max(cparams.n_outputs_max, (uint32_t)(inst.n_gen + 9));
+        }
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
@@ -2275,9 +2570,38 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        test t(inst, lmodel, ctx);
+        // create/recreate MTP draft context when --spec-type draft-mtp
+        if (use_spec) {
+            if (ctx_dft) {
+                // free old draft context and spec — ctx_other must point to current ctx
+                if (spec) {
+                    common_speculative_free(spec);
+                    spec = nullptr;
+                }
+                llama_free(ctx_dft);
+                ctx_dft = nullptr;
+            }
+            llama_context_params cparams_mtp = cparams;
+            cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.type_k        = spec_params.draft.cache_type_k;
+            cparams_mtp.type_v        = spec_params.draft.cache_type_v;
+            cparams_mtp.n_rs_seq      = 0;
+            cparams_mtp.n_outputs_max = 1;
+            cparams_mtp.ctx_other     = ctx;
+            cparams_mtp.embeddings    = false;
+            ctx_dft = llama_init_from_model(lmodel, cparams_mtp);
+            if (ctx_dft == nullptr) {
+                fprintf(stderr, "%s: error: failed to create MTP draft context\n", __func__);
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
+        }
 
-        llama_memory_clear(llama_get_memory(ctx), false);
+        test t(inst, lmodel, ctx);
+        t.spec_type = params.spec_type;
+
+        clear_context_memory(ctx, ctx_dft);
 
         // cool off before the test
         if (params.delay) {
@@ -2304,6 +2628,16 @@ int main(int argc, char ** argv) {
         }
 
         llama_attach_threadpool(ctx, threadpool, NULL);
+        if (ctx_dft) {
+            llama_attach_threadpool(ctx_dft, threadpool, NULL);
+        }
+
+        // initialize speculative system for this test (follows server pattern exactly)
+        if (use_spec && ctx_dft) {
+            spec_params.draft.ctx_tgt = ctx;
+            spec_params.draft.ctx_dft = ctx_dft;
+            spec = common_speculative_init(spec_params, 1);
+        }
 
         // warmup run
         if (!params.no_warmup) {
@@ -2312,7 +2646,8 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
                 //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = spec ? test_prompt_with_spec(ctx, spec, t.n_prompt, t.n_batch, t.n_threads)
+                                : test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
@@ -2324,21 +2659,35 @@ int main(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
                 }
-                bool res = test_gen(ctx, 1, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
+                if (spec) {
+                    int wd = 0, wa = 0;
+                    bool res = test_gen_speculative(ctx, ctx_dft, spec, 1, t.n_threads, wd, wa);
+                    if (!res) {
+                        fprintf(stderr, "%s: error: failed to run speculative gen warmup\n", __func__);
+                        if (spec) { common_speculative_free(spec); spec = nullptr; }
+                        llama_free(ctx);
+                        ggml_threadpool_free_fn(threadpool);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
+                } else {
+                    bool res = test_gen(ctx, 1, t.n_threads);
+                    if (!res) {
+                        fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
+                        llama_free(ctx);
+                        ggml_threadpool_free_fn(threadpool);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
                 }
             }
         }
 
         for (int i = 0; i < params.reps; i++) {
-            llama_memory_clear(llama_get_memory(ctx), false);
+            clear_context_memory(ctx, ctx_dft);
 
             if (t.n_depth > 0) {
-                bool is_cached = t.n_depth == cstate.depth;
+                bool is_cached = !spec && t.n_depth == cstate.depth;
 
                 if (is_cached) {
                     // if previously we have computed at this depth, just restore the state
@@ -2354,7 +2703,8 @@ int main(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                    bool res = spec ? test_prompt_with_spec(ctx, spec, t.n_depth, t.n_batch, t.n_threads)
+                                    : test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
@@ -2362,10 +2712,12 @@ int main(int argc, char ** argv) {
                         exit(1);
                     }
 
-                    // store the context state for reuse in later runs
-                    cstate.depth = t.n_depth;
-                    cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
-                    llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+                    // store the context state for reuse in later non-spec runs
+                    if (!spec) {
+                        cstate.depth = t.n_depth;
+                        cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
+                        llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+                    }
                 } else {
                     if (params.progress) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
@@ -2381,7 +2733,8 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = spec ? test_prompt_with_spec(ctx, spec, t.n_prompt, t.n_batch, t.n_threads)
+                                   : test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
@@ -2394,12 +2747,30 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run gen\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
+                if (spec) {
+                    int rd = 0, ra = 0;
+                    bool res = test_gen_speculative(ctx, ctx_dft, spec, t.n_gen, t.n_threads, rd, ra);
+                    if (!res) {
+                        fprintf(stderr, "%s: error: failed to run speculative gen\n", __func__);
+                        if (spec) { common_speculative_free(spec); spec = nullptr; }
+                        llama_free(ctx);
+                        ggml_threadpool_free_fn(threadpool);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
+                    t.spec_type = "draft-mtp";
+                    if (rd > 0) {
+                        t.spec_accept_rate = 100.0 * ra / rd;
+                    }
+                } else {
+                    bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                    if (!res) {
+                        fprintf(stderr, "%s: error: failed to run gen\n", __func__);
+                        llama_free(ctx);
+                        ggml_threadpool_free_fn(threadpool);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
                 }
             }
 
@@ -2419,9 +2790,21 @@ int main(int argc, char ** argv) {
 
         llama_perf_context_print(ctx);
 
+        if (spec) {
+            common_speculative_print_stats(spec);
+            common_speculative_free(spec);
+            spec = nullptr;
+        }
+
         llama_free(ctx);
 
         ggml_threadpool_free_fn(threadpool);
+    }
+
+    // free MTP draft context (shared across tests with same model)
+    if (ctx_dft) {
+        llama_free(ctx_dft);
+        ctx_dft = nullptr;
     }
 
     llama_model_free(lmodel);

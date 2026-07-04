@@ -262,6 +262,21 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-fused-ffn.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
+
+    # ponytail: TQ2_1S centroid/sign consistency guard. Reads .c/.comp source
+    # files by path (compile defs below); catches the single-file drift that
+    # gibberished TQ2_1S. Path-relative — breaks if shader files move.
+    set(TQ_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-vulkan/vulkan-shaders")
+    add_executable(test-tq-tables test-tq-tables.cpp get-model.cpp)
+    target_link_libraries(test-tq-tables PRIVATE llama-common)
+    target_compile_definitions(test-tq-tables PRIVATE
+        TQ_QUANT_C="${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-turbo-quant.c"
+        TQ_DEQUANT_COMP="${TQ_SHADER_DIR}/dequant_tq2_1s.comp"
+        TQ_MATVEC_COMP="${TQ_SHADER_DIR}/mul_mat_vec_tq2_1s.comp"
+        TQ_MULMM_COMP="${TQ_SHADER_DIR}/mul_mm_tq2_1s.comp"
+        TQ_COPY_COMP="${TQ_SHADER_DIR}/copy_to_quant.comp")
+    add_test(NAME test-tq-tables COMMAND $<TARGET_FILE:test-tq-tables>)
+    set_property(TEST test-tq-tables PROPERTY LABELS main)
 endif()
 
 # libmtmd

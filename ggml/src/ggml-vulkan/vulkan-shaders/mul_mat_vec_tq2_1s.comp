@@ -7,10 +7,12 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-// Lloyd-Max centroids for TQ2_1S (2-bit, 4 levels) — N(0, 1) optimal
-// Pre-multiplied by TQ2_INV_SQRT32 to save 1 multiply per dequant.
+// Lloyd-Max centroids for TQ2_1S (2-bit, 4 levels, Max 1960 N(0,1) optimal):
+// {+-0.4528, +-1.5104}. Pre-multiplied by TQ2_INV_SQRT32 to save 1 multiply per dequant.
+// = {+-0.4528, +-1.5104} * 0.17677669529663688. Must match dequant_tq2_1s.comp and
+// TQ2_1S_CENTROIDS in ggml-turbo-quant.c (unscaled).
 const float TQ2_CENTROIDS_SCALED[4] = float[4](
-    -0.26516506, -0.08838835,  0.08838835,  0.26516506
+    -0.26700352, -0.08004449,  0.08004449,  0.26700352
 );
 
 // WHT sign pattern for 32-element blocks (shared by TQ2, TQ3, TQ4)

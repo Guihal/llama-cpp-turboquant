@@ -1127,6 +1127,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "FUSED_FFN",
 };
 
 static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");

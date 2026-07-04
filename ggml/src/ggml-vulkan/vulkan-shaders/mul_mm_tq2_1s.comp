@@ -1,7 +1,7 @@
 #version 450
 
-// Fused TQ4_1S cooperative matrix MUL_MAT shader (HW-V1).
-// Reads packed TQ4_1S A-blocks (20 bytes: d0/d1 fp16 + 16 nibble bytes),
+// Fused TQ2_1S cooperative matrix MUL_MAT shader.
+// Reads packed TQ2_1S A-blocks (12 bytes: d0/d1 fp16 + 8 two-bit bytes),
 // does inline dequant (centroids*d, 5-stage WHT butterfly, signs, INV_SQRT32),
 // writes fp16 A-tile to shared memory for WMMA accumulation.
 // Eliminates the two-step fallback (standalone dequant → F16 temp → generic mul_mm).
@@ -49,7 +49,7 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer A {block_tq4_1s data_a[];};
+layout (binding = 0) readonly buffer A {block_tq2_1s data_a[];};
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
@@ -98,7 +98,7 @@ layout (constant_id = 8) const uint TN = 16;
 layout (constant_id = 9) const uint TK = 16;
 layout (constant_id = 10) const uint WARP = 32;
 
-// BK=32: each K-step processes one TQ4_1S block (32 elements per block)
+// BK=32: each K-step processes one TQ2_1S block (32 elements per block)
 #define BK 32
 
 #ifdef COOPMAT
@@ -121,15 +121,12 @@ shared u16vec2 row_ids[BN];
 uint _ne1;
 #endif
 
-// ---------- TQ4_1S constants ----------
-const float TQ4_CENTROIDS[16] = float[16](
-    -2.732590, -2.069017, -1.618046, -1.256231,
-    -0.942340, -0.656759, -0.388048, -0.128395,
-     0.128395,  0.388048,  0.656759,  0.942340,
-     1.256231,  1.618046,  2.069017,  2.732590
+// ---------- TQ2_1S constants ----------
+const float TQ2_CENTROIDS[4] = float[4](
+    -1.5104, -0.4528, 0.4528, 1.5104
 );
 
-const float TQ4_SIGNS[32] = float[32](
+const float TQ_SIGNS[32] = float[32](
     +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
     -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
     -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
@@ -259,17 +256,17 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
-        // --- Load A-tile: TQ4_1S dequant (centroid*scale only, NO WHT/signs/INV_SQRT32) ---
+        // --- Load A-tile: TQ2_1S dequant (centroid*scale only, NO WHT/signs/INV_SQRT32) ---
         // B-side WHT: A_orig = signs*INV_SQRT32*WHT(A_wht); by WHT orthogonality the
         // matmul A_orig·B == A_wht·B' with B' = INV_SQRT32*WHT(signs*B) (numpy-verified,
         // max abs 5e-14). So A-load stores bare A_wht = centroid*d; the WHT moves to
         // the B-side pass below and is amortized over all M rows. Even-tid threads
-        // pack the (tid, tid+1) element pair from one nibble byte into one f16vec2
-        // slot; odd-tid threads idle. rows_per_pass=BLOCK_SIZE/BK; disjoint rows/slots
-        // so no internal barrier is needed.
+        // pack the (tid, tid+1) element pair from one TQ2 byte into one f16vec2 slot;
+        // odd-tid threads idle. rows_per_pass=BLOCK_SIZE/BK; disjoint rows/slots so no
+        // internal barrier is needed.
         {
             const uint lane = gl_LocalInvocationIndex;
-            const uint tid  = lane % BK;  // 0..31 element index within TQ4 block
+            const uint tid  = lane % BK;  // 0..31 element index within TQ2 block
             const uint rows_per_pass = BLOCK_SIZE / BK;
 
             for (uint base = 0u; base < BM; base += rows_per_pass) {
@@ -281,17 +278,17 @@ void main() {
                         const uint a_idx = pos_a + row * stride_a_blocks;
                         const float d0 = float(data_a[a_idx].d0);
                         const float d1 = float(data_a[a_idx].d1);
-                        // Elements tid and tid+1 share nibble byte tid/2 (the d0/d1
-                        // boundary 15|16 falls between bytes 7|8, so each byte is single-d).
-                        const uint bidx = tid / 2u;
+                        // TQ2 packs 4 elements per byte. For even tid, tid and tid+1
+                        // share one byte; the d0/d1 boundary 15|16 falls between bytes 3|4.
+                        const uint bidx = tid / 4u;
                         const uint qsb = uint(data_a[a_idx].qs[bidx]);
-                        const uint nib0 = qsb & 0xFu;            // element tid  (low nibble)
-                        const uint nib1 = (qsb >> 4u) & 0xFu;    // element tid+1 (high nibble)
+                        const uint idx0 = (qsb >> ((tid & 3u) * 2u)) & 0x3u;
+                        const uint idx1 = (qsb >> (((tid + 1u) & 3u) * 2u)) & 0x3u;
                         const float dt  = (tid < 16u)       ? d0 : d1;
                         const float dt1 = (tid + 1u < 16u)  ? d0 : d1;
                         buf_a[row * SHMEM_STRIDE + slot] = FLOAT_TYPEV2(
-                            FLOAT_TYPE(TQ4_CENTROIDS[nib0] * dt),
-                            FLOAT_TYPE(TQ4_CENTROIDS[nib1] * dt1)
+                            FLOAT_TYPE(TQ2_CENTROIDS[idx0] * dt),
+                            FLOAT_TYPE(TQ2_CENTROIDS[idx1] * dt1)
                         );
                     } else {
                         buf_a[row * SHMEM_STRIDE + slot] = FLOAT_TYPEV2(FLOAT_TYPE(0.0));
@@ -368,7 +365,7 @@ void main() {
                     const FLOAT_TYPEV2 pr = buf_b[col * SHMEM_STRIDE + k / 2u];
                     val = float((k & 1u) == 0u ? pr.x : pr.y);
                 }
-                val *= TQ4_SIGNS[k];
+                val *= TQ_SIGNS[k];
 
                 // 5-stage in-register WHT via subgroup shuffle. Partner index XOR<=16
                 // stays inside the 32-lane half, so a wave64 runs two independent 32-pt
@@ -394,7 +391,7 @@ void main() {
 #endif
 
         // Advance positions
-        // pos_a is in block_tq4_1s units (1 block = 32 elements); advance by 1 block
+        // pos_a is in block_tq2_1s units (1 block = 32 elements); advance by 1 block
         pos_a += 1;
         // pos_b is in B_TYPE vector units; advance by one K tile.
         pos_b += BK / LOAD_VEC_B;

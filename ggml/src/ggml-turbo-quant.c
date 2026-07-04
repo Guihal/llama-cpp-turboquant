@@ -959,33 +959,37 @@ static void quantize_row_tq4_1s_impl(const float * GGML_RESTRICT x, block_tq4_1s
         rms0 = sqrtf(rms0 / 16.0f);
         rms1 = sqrtf(rms1 / 16.0f);
 
-        /* 3. Scale search (9 points) — weighted MSE */
+        /* 3. Decoupled d0/d1 scale search (9 points each) — weighted MSE.
+         * block-MSE = err0(d0) + err1(d1) is separable, so two independent 9-point
+         * searches give the same minimum as the 9x9 product grid at 18 vs 81 evals.
+         * Previously a single shared scales[si] multiplier coupled both halves.
+         * The 6-iter Lloyd refine below already updates d0,d1 independently. */
         static const float scales[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
         float best_d0 = rms0, best_d1 = rms1;
-        float best_err = 1e30f;
 
+        float best_err0 = 1e30f;
         for (int si = 0; si < 9; si++) {
             float d0 = rms0 * scales[si];
-            float d1 = rms1 * scales[si];
             float inv0 = (d0 > 1e-10f) ? 1.0f / d0 : 0.0f;
-            float inv1 = (d1 > 1e-10f) ? 1.0f / d1 : 0.0f;
-
             float err = 0.0f;
             for (int j = 0; j < 16; j++) {
                 int idx = tq4_0_choose_index(buf[j] * inv0);
                 float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d0;
                 err += w0 * diff * diff;
             }
+            if (err < best_err0) { best_err0 = err; best_d0 = d0; }
+        }
+        float best_err1 = 1e30f;
+        for (int si = 0; si < 9; si++) {
+            float d1 = rms1 * scales[si];
+            float inv1 = (d1 > 1e-10f) ? 1.0f / d1 : 0.0f;
+            float err = 0.0f;
             for (int j = 16; j < 32; j++) {
                 int idx = tq4_0_choose_index(buf[j] * inv1);
                 float diff = buf[j] - TQ4_0_CENTROIDS[idx] * d1;
                 err += w1 * diff * diff;
             }
-            if (err < best_err) {
-                best_err = err;
-                best_d0 = d0;
-                best_d1 = d1;
-            }
+            if (err < best_err1) { best_err1 = err; best_d1 = d1; }
         }
 
         /* 4. Iterative refinement (6 iterations) — weighted LS */
@@ -1070,11 +1074,16 @@ size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
 }
 
 /* ---------- TQ2_1S ---------- */
-static const float TQ2_1S_CENTROIDS[4] = { -1.5f, -0.5f, 0.5f, 1.5f };
+// Lloyd-Max 4-level centroids for N(0,1) (Max 1960): {+-0.4528, +-1.5104}.
+// Stored at unit-sigma; quantize divides buf by d (block scale) before choosing
+// index, dequant multiplies centroid*d. Mirrored in dequant_tq2_1s.comp,
+// mul_mat_vec_tq2_1s.comp (scaled), and copy_to_quant.comp TC2/TM2 (the reference).
+static const float TQ2_1S_CENTROIDS[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
 static int tq2_1s_choose_index(float v) {
-    if (v < -1.0f) return 0;
-    if (v <  0.0f) return 1;
-    if (v <  1.0f) return 2;
+    // boundaries = midpoints of adjacent centroids = +-0.9816
+    if (v < -0.9816f) return 0;
+    if (v <  0.0f)   return 1;
+    if (v <  0.9816f) return 2;
     return 3;
 }
 static void quantize_row_tq2_1s_impl(const float * GGML_RESTRICT x, block_tq2_1s * GGML_RESTRICT y,
@@ -1100,14 +1109,28 @@ static void quantize_row_tq2_1s_impl(const float * GGML_RESTRICT x, block_tq2_1s
         for(int j=0;j<16;j++) rms0+=buf[j]*buf[j];
         for(int j=16;j<32;j++) rms1+=buf[j]*buf[j];
         rms0=sqrtf(rms0/16); rms1=sqrtf(rms1/16);
-        float bd0=rms0,bd1=rms1,be=1e30f;
+        // Decoupled d0/d1 search: block-MSE = err0(d0) + err1(d1) is separable
+        // (each half's indices/scale are independent), so the joint min over the
+        // 9x9 grid equals min_d0(err0)+min_d1(err1). Two 9-point searches instead
+        // of 81, identical result. Previously a single shared sc[si] multiplier
+        // coupled both halves (d0=rms0*sc, d1=rms1*sc) and could not fit differing
+        // half kurtosis — ~2-5% MSE free fix. The 6-iter Lloyd refine below already
+        // updates d0,d1 independently, so only the coarse search changes here.
+        float bd0=rms0,bd1=rms1;
         static const float sc[]={0.6f,0.7f,0.8f,0.9f,1.0f,1.1f,1.2f,1.35f,1.5f};
+        float be0=1e30f;
         for(int si=0;si<9;si++){
-            float d0=rms0*sc[si],d1=rms1*sc[si];
-            float i0=d0>1e-10f?1/d0:0,i1=d1>1e-10f?1/d1:0,e=0;
+            float d0=rms0*sc[si];
+            float i0=d0>1e-10f?1/d0:0,e=0;
             for(int j=0;j<16;j++){int id=tq2_1s_choose_index(buf[j]*i0);float d=buf[j]-TQ2_1S_CENTROIDS[id]*d0;e+=w0*d*d;}
+            if(e<be0){be0=e;bd0=d0;}
+        }
+        float be1=1e30f;
+        for(int si=0;si<9;si++){
+            float d1=rms1*sc[si];
+            float i1=d1>1e-10f?1/d1:0,e=0;
             for(int j=16;j<32;j++){int id=tq2_1s_choose_index(buf[j]*i1);float d=buf[j]-TQ2_1S_CENTROIDS[id]*d1;e+=w1*d*d;}
-            if(e<be){be=e;bd0=d0;bd1=d1;}
+            if(e<be1){be1=e;bd1=d1;}
         }
         for(int it=0;it<6;it++){
             float i0=bd0>1e-10f?1/bd0:0,i1=bd1>1e-10f?1/bd1:0,n0=0,d0=0,n1=0,d1=0;

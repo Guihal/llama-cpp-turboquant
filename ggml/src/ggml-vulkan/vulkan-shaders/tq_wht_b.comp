@@ -1,0 +1,51 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer B { float data_b[]; };
+layout (binding = 1) writeonly buffer D { float16_t data_d[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint K;
+    uint N;
+    uint padded_N;
+    uint stride_b;
+    uint batch_stride_b;
+} p;
+
+const float TQ_SIGNS[32] = float[32](
+    +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+    -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+    -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+    -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0
+);
+
+const float INV_SQRT32 = 0.17677669529663688;
+
+void main() {
+    const uint k = gl_LocalInvocationID.x;
+    const uint k_block = gl_WorkGroupID.x * 32u;
+    const uint col = gl_WorkGroupID.y;
+    const uint batch = gl_WorkGroupID.z;
+
+    float val = 0.0;
+    if (col < p.N) {
+        val = data_b[batch * p.batch_stride_b + col * p.stride_b + k_block + k];
+    }
+    val *= TQ_SIGNS[k];
+
+    [[unroll]] for (uint s = 0u; s < 5u; ++s) {
+        const float partner = subgroupShuffle(val, k ^ (1u << s));
+        val = (((k >> s) & 1u) != 0u) ? (partner - val) : (val + partner);
+    }
+    val *= INV_SQRT32;
+
+    data_d[batch * p.padded_N * p.K + col * p.K + k_block + k] = float16_t(val);
+}

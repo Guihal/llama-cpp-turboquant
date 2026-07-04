@@ -11,9 +11,11 @@ layout (binding = 0) readonly buffer A {block_tq2_1s data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 void main() {
-    // Lloyd-Max centroids for 2-bit normal quantization (4 levels, uniform)
+    // Lloyd-Max centroids for 2-bit N(0,1) quantization (Max 1960): {+-0.4528, +-1.5104}.
+    // Multiplied by block scale d at dequant time. Must match TQ2_1S_CENTROIDS in
+    // ggml-turbo-quant.c and TC2 in copy_to_quant.comp (scaled by 1/sqrt(128)).
     const float centroids[4] = float[4](
-        -1.5, -0.5,  0.5,  1.5
+        -1.5104, -0.4528,  0.4528,  1.5104
     );
 
     // WHT sign pattern for inverse RHT normalization

@@ -1,38 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
-// QWEN35_FUSE_QKV: fuse wq|wk|wv into a single ggml_mul_mat for full-attn layers.
-// Default OFF. When ON, the fused path is emitted via runtime ggml_concat; on
-// hosts where concat is unsupported for the layer's weight type (e.g. Vulkan
-// pipeline_concat only supports f32/f16/i32, so TQ4_1S forces CPU fallback)
-// this is a correctness A/B only — no projected perf gain on this hardware.
-// Spec: docs/tq4-accel-research/specs/042-spec-next-qkv-fusion.md
-static bool qwen35_fuse_qkv_enabled() {
-    static const bool enabled = []() {
-        const char * e = getenv("QWEN35_FUSE_QKV");
-        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
-    }();
-    return enabled;
-}
-
-// Forward declaration for G.2 Q/K/V fusion helper (defined further below).
-// Defined at file scope as a free function to avoid duplicating the fused/fallback
-// branch across graph + graph_mtp. Takes the owning llm_graph_context so it can
-// call build_lora_mm (a method of llm_graph_context).
-static void build_attn_qkv_fused(
-        llm_graph_context *   gctx,
-        ggml_context *        ctx0,
-        const llama_layer &   layer,
-        ggml_tensor *         cur,
-        int                   il,
-        int64_t               n_tokens,
-        int64_t               n_embd_head,
-        int64_t               n_head,
-        int64_t               n_head_kv,
-        ggml_tensor *&        Qcur_full,
-        ggml_tensor *&        Kcur,
-        ggml_tensor *&        Vcur);
-
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -296,41 +264,37 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full;
-    ggml_tensor * Kcur;
-    ggml_tensor * Vcur;
-    build_attn_qkv_fused(this, ctx0, model.layers[il], cur, il,
-                         n_tokens, n_embd_head, n_head, n_head_kv,
-                         Qcur_full, Kcur, Vcur);
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
-    cb(Kcur, "Kcur", il);
-    cb(Vcur, "Vcur", il);
 
-    // Qcur: 3D view. nb[2] = Qcur_full->nb[1] (= QKV row stride when fused, = q_total*es
-    // when not fused); both equal the actual storage stride so token-to-token addressing
-    // is correct for n_tokens > 1.
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
-        Qcur_full->nb[1], 0);
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
 
-    // Apply K normalization (Kcur is already 3D from helper).
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);
+
+    // Apply K normalization
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
-    // gate: 3D view over Qcur_full. nb[2] = Qcur_full->nb[1] for correct token stride.
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
-        Qcur_full->nb[1],
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
         ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
 
-    // Vcur is already 3D from helper.
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
     // Apply MRoPE
     Qcur = ggml_rope_multi(
@@ -590,37 +554,32 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
-    ggml_tensor * Qcur_full;
-    ggml_tensor * Kcur;
-    ggml_tensor * Vcur;
-    build_attn_qkv_fused(this, ctx0, layer, cur, il,
-                         n_tokens, n_embd_head, n_head, n_head_kv,
-                         Qcur_full, Kcur, Vcur);
+    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);
-    cb(Kcur, "mtp_Kcur", il);
-    cb(Vcur, "mtp_Vcur", il);
 
-    // Qcur: 3D view. nb[2] = Qcur_full->nb[1] for correct token stride (n_tokens > 1).
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
             n_embd_head, n_head, n_tokens,
             ggml_element_size(Qcur_full) * n_embd_head * 2,
-            Qcur_full->nb[1], 0);
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            0);
     Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "mtp_Qcur_normed", il);
 
-    // gate: 3D view. nb[2] = Qcur_full->nb[1].
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
             n_embd_head, n_head, n_tokens,
             ggml_element_size(Qcur_full) * n_embd_head * 2,
-            Qcur_full->nb[1],
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
             ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "mtp_gate", il);
 
-    // Kcur, Vcur already 3D from helper.
+    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "mtp_Kcur_normed", il);
 
+    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 
     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
@@ -680,71 +639,4 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
-}
-
-// ponytail: QWEN35_FUSE_QKV helper. Returns Qcur_full as 2D [q_total, n_tokens]
-// (joint Q+gate width, q_total = n_embd_head * 2 * n_head), and Kcur/Vcur as 3D
-// views [n_embd_head, n_head_kv, n_tokens] so the caller does not need to reshape.
-// In fused mode (QWEN35_FUSE_QKV=1) emits a single mul_mat over concat(wq|wk|wv, dim=1)
-// and views the slice with QKV-row stride as nb[2]. In fallback mode emits three
-// contiguous mul_mats and reuses their row strides. Spec: 042-audit-G-H.md G.2.
-static void build_attn_qkv_fused(
-        llm_graph_context *   gctx,
-        ggml_context *        ctx0,
-        const llama_layer &   layer,
-        ggml_tensor *         cur,
-        int                   il_,
-        int64_t               n_tokens,
-        int64_t               n_embd_head,
-        int64_t               n_head,
-        int64_t               n_head_kv,
-        ggml_tensor *&        Qcur_full,
-        ggml_tensor *&        Kcur,
-        ggml_tensor *&        Vcur) {
-    const int64_t q_total = n_embd_head * 2 * n_head;
-    const int64_t k_total = n_embd_head * n_head_kv;
-
-    if (qwen35_fuse_qkv_enabled()) {
-        // ponytail: BitNet per-tensor scales must be absent; Qwen3.5 GGUF does not populate them.
-        GGML_ASSERT(layer.wq_s == nullptr);
-        GGML_ASSERT(layer.wk_s == nullptr);
-        GGML_ASSERT(layer.wv_s == nullptr);
-
-        ggml_tensor * wqkv_tmp = ggml_concat(ctx0, layer.wq, layer.wk, 1);
-        ggml_tensor * wqkv     = ggml_concat(ctx0, wqkv_tmp, layer.wv, 1);
-
-        ggml_tensor * QKV_full = gctx->build_lora_mm(wqkv, cur, /*scale=*/nullptr);
-        // QKV_full: [q_total + k_total + v_total, n_tokens], contiguous (mul_mat output)
-
-        const size_t es     = ggml_element_size(QKV_full);
-        const size_t nb_qkv = QKV_full->nb[1];            // = es * (q_total + k_total + v_total)
-        const size_t off_q  = 0;
-        const size_t off_k  = q_total * es;
-        const size_t off_v  = (q_total + k_total) * es;
-
-        // Qcur_full: 2D view. nb[1] = QKV row stride (NOT q_total stride), so token-to-token
-        // offset equals the actual storage stride when n_tokens > 1.
-        Qcur_full = ggml_view_2d(ctx0, QKV_full, q_total, n_tokens, nb_qkv, off_q);
-
-        // Kcur, Vcur: direct 3D views over QKV_full. nb[1] = es*n_embd_head (head stride
-        // within K/V row), nb[2] = nb_qkv (token stride). view_3d's offset argument is
-        // absolute bytes from QKV_full (the ultimate storage source).
-        Kcur = ggml_view_3d(ctx0, QKV_full, n_embd_head, n_head_kv, n_tokens,
-                            es * n_embd_head, nb_qkv, off_k);
-        Vcur = ggml_view_3d(ctx0, QKV_full, n_embd_head, n_head_kv, n_tokens,
-                            es * n_embd_head, nb_qkv, off_v);
-    } else {
-        Qcur_full = gctx->build_lora_mm(layer.wq, cur, layer.wq_s);
-        // Qcur_full: [q_total, n_tokens], contiguous.
-
-        ggml_tensor * Kcur_2d = gctx->build_lora_mm(layer.wk, cur, layer.wk_s);
-        ggml_tensor * Vcur_2d = gctx->build_lora_mm(layer.wv, cur, layer.wv_s);
-        // Each contiguous; nb[1] = k_total*es or v_total*es. nb[2] of the 3D view below
-        // equals the row stride of the source.
-
-        Kcur = ggml_view_3d(ctx0, Kcur_2d, n_embd_head, n_head_kv, n_tokens,
-                            ggml_element_size(Kcur_2d) * n_embd_head, Kcur_2d->nb[1], 0);
-        Vcur = ggml_view_3d(ctx0, Vcur_2d, n_embd_head, n_head_kv, n_tokens,
-                            ggml_element_size(Vcur_2d) * n_embd_head, Vcur_2d->nb[1], 0);
-    }
 }
